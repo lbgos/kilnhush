@@ -1,5 +1,6 @@
-// Starts and stops the things a mode is made of: systemd units the host
-// already has, or commands the agent runs as its own children.
+// Starts and stops the things a mode is made of: systemd units and docker
+// containers the host already has, or commands the agent runs as its own
+// children.
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { connect } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -18,7 +19,9 @@ export interface Service {
 const run = promisify(execFile);
 
 export function createService(spec: ServiceSpec): Service {
-  return spec.unit ? systemdUnit(spec, spec.unit) : command(spec);
+  if (spec.unit) return systemdUnit(spec, spec.unit);
+  if (spec.container) return container(spec, spec.container);
+  return command(spec);
 }
 
 /**
@@ -54,6 +57,36 @@ function systemdUnit(spec: ServiceSpec, unit: string): Service {
     },
     async stop() {
       await run("systemctl", ["stop", unit], { timeout: 120_000 });
+    },
+  };
+}
+
+/**
+ * Maps `docker inspect` status to running or not. A paused or restarting
+ * container still holds VRAM. Anything unrecognized throws.
+ */
+export function containerRunning(status: string) {
+  if (status === "created" || status === "exited" || status === "dead") return false;
+  if (["running", "restarting", "paused", "removing"].includes(status)) return true;
+  throw new Error(`unknown container status ${JSON.stringify(status)}`);
+}
+
+/** A container the host already has. A missing container throws rather than reading as stopped. */
+function container(spec: ServiceSpec, name: string): Service {
+  const active = async () => {
+    const { stdout } = await run("docker", ["inspect", "--format", "{{.State.Status}}", name], { timeout: 10_000 });
+    return containerRunning(stdout.trim());
+  };
+  return {
+    key: spec.key,
+    name,
+    active,
+    async start() {
+      await run("docker", ["start", name], { timeout: spec.readyTimeout });
+      await waitReady(spec, active);
+    },
+    async stop() {
+      await run("docker", ["stop", "--time", "30", name], { timeout: 120_000 });
     },
   };
 }

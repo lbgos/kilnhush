@@ -49,3 +49,10 @@ test("proxy targets must parse as http(s) URLs", () => {
   assert.throws(() => withTarget("ftp://x"), /not an http\(s\) URL/);
   assert.ok(withTarget("http://127.0.0.1:8080"));
 });
+
+test("a service is exactly one of unit, container or cmd", () => {
+  const withService = (service: string) => parseConfig(`default: v\nmodes: { v: { services: [${service}] } }`);
+  assert.equal(withService("{ container: ollama }").modes.get("v")?.services[0]?.key, "container:ollama");
+  assert.throws(() => withService("{ unit: a, container: b }"), /exactly one of unit, container or cmd/);
+  assert.throws(() => withService("{ health: tcp://x:1 }"), /exactly one of unit, container or cmd/);
+});

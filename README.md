@@ -53,7 +53,7 @@ modes:
       - unit: jupyter-3080.service
 ```
 
-A service is a systemd `unit` or a `cmd` the agent runs itself. Full example: [`examples/vm111.yaml`](examples/vm111.yaml), my RTX 3080 with Home Assistant voice, Bonsai 27B and JupyterLab.
+A service is a systemd `unit`, a docker `container`, or a `cmd` the agent runs itself. Full example: [`examples/vm111.yaml`](examples/vm111.yaml), my RTX 3080 with Home Assistant voice, Bonsai 27B and JupyterLab.
 
 ## Details
 

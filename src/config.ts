@@ -22,6 +22,8 @@ const duration = type("string").pipe((text, ctx) => parseDuration(text) ?? ctx.e
 const serviceSchema = type({
   "+": "reject",
   "unit?": "string > 0",
+  /** Docker container name, started and stopped with `docker start/stop`. */
+  "container?": "string > 0",
   "cmd?": "string[]",
   /** http(s)://... must answer 2xx, tcp://host:port must accept a connection. */
   "health?": /^(https?|tcp):\/\/.+/,
@@ -73,11 +75,14 @@ export function parseConfig(yamlText: string) {
 
       const services = m.services.map((s, i) => {
         const cmd = s.cmd ?? [];
-        if (Boolean(s.unit) === cmd.length > 0) bad(`service ${i} needs exactly one of unit or cmd`);
+        if ([s.unit, s.container, cmd.length > 0].filter(Boolean).length !== 1) {
+          bad(`service ${i} needs exactly one of unit, container or cmd`);
+        }
         return {
-          key: s.unit ? `unit:${s.unit}` : `cmd:${cmd.join(" ")}`,
-          name: s.unit ?? cmd[0] ?? "?",
+          key: s.unit ? `unit:${s.unit}` : s.container ? `container:${s.container}` : `cmd:${cmd.join(" ")}`,
+          name: s.unit ?? s.container ?? cmd[0] ?? "?",
           unit: s.unit,
+          container: s.container,
           cmd,
           health: s.health,
           readyTimeout: s.ready_timeout ?? 120_000,
