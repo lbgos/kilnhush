@@ -17,7 +17,7 @@ export function parseDuration(text: string): number | undefined {
   return undefined;
 }
 
-const duration = type("string").pipe((text, ctx) => parseDuration(text) ?? ctx.error("a duration like 20m or 1h30m"));
+export const duration = type("string").pipe((text, ctx) => parseDuration(text) ?? ctx.error("a duration like 20m or 1h30m"));
 
 const serviceSchema = type({
   "+": "reject",
