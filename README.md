@@ -62,6 +62,8 @@ A service runs as a systemd `unit`, a docker `container`, a `cmd` the agent runs
 
 **Proxy.** Give a service `proxy: <port>` and point its clients there instead of at the service. Real work (a generation, a prompt, opening the web UI) wakes it; the plugin decides what counts. Health checks and status polls never wake anything: they get a 503 while the service is off, or its last answer for things like `/v1/models`. WebSockets pass through while it runs and close when it stops. The agent's own `/v1/*` routes by the request's `model` across all services with `models`.
 
+**Settings.** The agent owns its config file. Edits through the API (the bot uses it) are validated, written atomically with a `.bak`, and applied live; the service holding the card can't be removed or rerouted until it stops. The API only adds units and containers that exist on the host, never commands. After editing the file by hand, run `kilnhush reload` (or send SIGHUP).
+
 **Startup.** The agent adopts the service whose processes are running. If what runs matches no single service, it refuses to start rather than guess.
 
 **Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit. Run the agent under a supervisor that kills its whole cgroup if it crashes, like the example unit's `KillMode=control-group`.

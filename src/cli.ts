@@ -6,20 +6,22 @@ import { parseArgs } from "node:util";
 import { Agent } from "./agent.ts";
 import { type ActionResult, agentClient } from "./api.ts";
 import { Bot, telegram } from "./bot.ts";
-import { loadConfig } from "./config.ts";
 import { fakeJupyter, fakeLlama } from "./fake.ts";
 import { formatState } from "./format.ts";
 import { readGpu } from "./probe.ts";
 import { createAgentServer } from "./server.ts";
-import { probeService } from "./plugins/index.ts";
-import { createProxy } from "./proxy.ts";
-import { createRunner } from "./runners.ts";
+import { discover } from "./discover.ts";
+import { plugins, probeService } from "./plugins/index.ts";
+import { portFree, proxyPool } from "./proxy.ts";
+import { createRunner, hostHas } from "./runners.ts";
+import { ConfigStore, reload } from "./settings.ts";
 
 const usage = `kilnhush agent  --config kilnhush.yaml     run on the GPU host
 kilnhush bot                              Telegram bot, configured by env
 kilnhush status                           print the agent's state
 kilnhush start <service> [--force]        give the card to a service
 kilnhush stop <service> [--force]         stop the service holding the card
+kilnhush reload                           apply a hand-edited config file
 kilnhush fake llama|jupyter --port N      stand-ins for the demo
 
 env: KILNHUSH_TOKEN      agent API token (required when the agent listens beyond loopback)
@@ -46,7 +48,8 @@ const client = () => agentClient(process.env.KILNHUSH_AGENT ?? "http://127.0.0.1
 const [command, arg] = positionals;
 
 async function agent() {
-  const config = loadConfig(opts.config);
+  const store = await ConfigStore.load(opts.config);
+  const { config } = store;
   const url = new URL(`http://${config.listen}`);
   const host = url.hostname.replace(/^\[|\]$/g, "");
   const loopback = host === "localhost" || host === "::1" || (isIP(host) === 4 && host.startsWith("127."));
@@ -62,14 +65,14 @@ async function agent() {
     log,
   });
   await agent.init();
-  const server = createAgentServer(agent, token);
-  server.listen(Number(url.port), host, () => log(`listening on ${config.listen}, ${agent.holder ?? "no service"} holds the card`));
-  const proxies = config.services.flatMap((s) => {
-    if (s.proxy === undefined) return [];
-    const proxy = createProxy(agent, s);
-    proxy.server.listen(s.proxy, host, () => log(`proxy for ${s.name} on ${host}:${s.proxy}`));
-    return [proxy];
+  const server = createAgentServer(agent, token, {
+    store,
+    hostHas,
+    discover: () => discover(agent.config.gpu, plugins.values()),
+    portFree: (port) => portFree(port, host),
   });
+  server.listen(Number(url.port), host, () => log(`listening on ${config.listen}, ${agent.holder ?? "no service"} holds the card`));
+  const proxies = proxyPool(agent, host, log);
   // The next tick waits for this one, so a slow switch never queues ticks up.
   let timer: NodeJS.Timeout | undefined;
   const tick = () => {
@@ -85,14 +88,20 @@ async function agent() {
   const stop = async () => {
     clearTimeout(timer);
     // Let proxied responses finish before command services stop, up to 10s.
-    const closed = [new Promise((resolve) => server.close(resolve)), ...proxies.map((p) => p.close())];
-    await Promise.race([Promise.all(closed), sleep(10_000)]);
-    for (const s of [server, ...proxies.map((p) => p.server)]) s.closeAllConnections();
+    const servers = [server, ...proxies.servers()];
+    await Promise.race([Promise.all([new Promise((resolve) => server.close(resolve)), proxies.close()]), sleep(10_000)]);
+    for (const s of servers) s.closeAllConnections();
     await agent.shutdown();
     process.exit(0);
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  process.on("SIGHUP", () => {
+    reload(agent, store).then(
+      () => log("config reloaded"),
+      (err: Error) => log(`reload refused: ${err.message}`),
+    );
+  });
 }
 
 async function bot() {
@@ -115,6 +124,12 @@ async function main() {
       return bot();
     case "status":
       return console.log(formatState(await client().state()));
+    case "reload": {
+      const result = await client().settings("reload");
+      if (!result.ok) throw new Error(result.error);
+      for (const warning of result.view.warnings) console.log(`warning: ${warning}`);
+      return console.log("reloaded");
+    }
     case "start":
     case "stop": {
       if (!arg) throw new Error(`${command} needs a service`);

@@ -1,7 +1,9 @@
 // The agent's HTTP contract and a small client for it. The bot and the CLI use
 // the client; the agent server produces these shapes.
+import type { Discovery } from "./discover.ts";
 import type { Run } from "./plugins/types.ts";
 import type { Gpu } from "./probe.ts";
+import type { ServicePatch, SettingsView } from "./settings.ts";
 
 export type AgentEvent = {
   at: number;
@@ -42,6 +44,9 @@ export type State = {
   events: AgentEvent[];
 };
 
+export type SettingsAction = "view" | "reload" | "add" | "update" | "move" | "remove";
+export type { ServicePatch };
+
 export type ActionResult =
   | { ok: true; state: State }
   | { ok: false; busy: { service: string; risks: string[] } }
@@ -75,5 +80,24 @@ export function agentClient(baseUrl: string, token?: string) {
     },
     start: (service: string, force = false) => act("start", service, force),
     stop: (service: string, force = false) => act("stop", service, force),
+
+    /** Reads or edits settings. Edits answer with the new settings or the reason they were refused. */
+    async settings(action: SettingsAction, body?: object): Promise<{ ok: true; view: SettingsView } | { ok: false; error: string }> {
+      const read = action === "view";
+      const res = await fetch(url(`/api/settings/${action}`), {
+        method: read ? "GET" : "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        ...(read ? {} : { body: JSON.stringify(body ?? {}) }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const data = (await res.json()) as SettingsView & { error?: string };
+      return res.ok ? { ok: true, view: data } : { ok: false, error: data.error ?? `agent: ${res.status}` };
+    },
+
+    async discover(): Promise<Discovery> {
+      const res = await fetch(url("/api/settings/discover"), { headers, signal: AbortSignal.timeout(60_000) });
+      if (!res.ok) throw new Error(`agent: ${res.status} ${await res.text()}`);
+      return (await res.json()) as Discovery;
+    },
   };
 }

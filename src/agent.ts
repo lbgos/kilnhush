@@ -38,6 +38,9 @@ export type AgentDeps = {
   log: (msg: string) => void;
 };
 
+/** What must not change under a running service. */
+const runShape = (s: ServiceSpec) => JSON.stringify([s.plugin.id, s.url, s.health, s.procs]);
+
 /** Runs async sections one at a time, in call order. */
 class Lock {
   #tail: Promise<unknown> = Promise.resolve();
@@ -69,18 +72,17 @@ export class Agent {
   #events: AgentEvent[] = [];
   #lock = new Lock();
   #runners = new Map<string, Runner>();
-  #stopListeners: ((name: string) => void)[] = [];
+  /** The spec each runner was made from, as JSON. */
+  #runnerShapes = new Map<string, string>();
+  #stopListeners = new Set<(name: string) => void>();
+  #configListeners = new Set<(config: Config) => void>();
 
   constructor(
     config: Config,
     private deps: AgentDeps,
   ) {
     this.#config = config;
-    for (const service of config.services) {
-      for (const proc of service.procs) {
-        if (!this.#runners.has(proc.key)) this.#runners.set(proc.key, deps.runner({ ...proc, readyTimeout: service.readyTimeout }));
-      }
-    }
+    this.#syncRunners();
   }
 
   get config() {
@@ -236,9 +238,16 @@ export class Agent {
     return this.#holder === name && !this.#gate;
   }
 
-  /** Calls `fn` with a service's name each time its processes have stopped. */
+  /** Calls `fn` with a service's name each time its processes have stopped. Returns an unsubscribe. */
   onStop(fn: (name: string) => void) {
-    this.#stopListeners.push(fn);
+    this.#stopListeners.add(fn);
+    return () => void this.#stopListeners.delete(fn);
+  }
+
+  /** Calls `fn` after each config change is applied. Returns an unsubscribe. */
+  onConfig(fn: (config: Config) => void) {
+    this.#configListeners.add(fn);
+    return () => void this.#configListeners.delete(fn);
   }
 
   async state(): Promise<State> {
@@ -272,6 +281,40 @@ export class Agent {
   }
 
   /**
+   * Swaps in the config `build` returns. The holder must still exist and run
+   * the same way: removing it or changing its plugin, url or processes is
+   * refused until it stops. Other changes only affect later decisions; a new
+   * priority order never evicts anything by itself. `build` and `commit` run
+   * inside the lock, so edits apply in order, and a failed commit changes
+   * nothing.
+   */
+  reconfigure(build: () => Config | Promise<Config>, commit: (next: Config) => Promise<unknown> = async () => {}) {
+    return this.#lock.run(async () => {
+      // Leftovers of a failed start must stay known until a forced start clears them.
+      if (this.#stuck) throw new Error(this.#stuck);
+      const next = await build();
+      // The listener and the GPU reader are set up once, at startup.
+      if (next.listen !== this.#config.listen || next.gpu !== this.#config.gpu) {
+        throw new Error("listen and gpu change only with a restart of the agent");
+      }
+      const holder = this.#holder;
+      if (holder) {
+        const after = next.services.find((s) => s.name === holder);
+        if (!after) throw new Error(`stop ${holder} before removing it`);
+        if (runShape(after) !== runShape(this.service(holder))) throw new Error(`stop ${holder} before changing how it runs`);
+        // A new run setting starts its idle clock now, so on_demand does not stop it at once.
+        if (after.run !== this.service(holder).run) this.#lastRequest.set(holder, this.deps.now());
+      }
+      await commit(next);
+      if (next.home !== this.#config.home) this.#homePaused = false;
+      this.#config = next;
+      this.#syncRunners();
+      for (const fn of this.#configListeners) fn(next);
+      return next;
+    });
+  }
+
+  /**
    * Stops processes the agent spawned itself; units and containers keep
    * running. Command processes are children of the agent and cannot outlive
    * it, so anything that must survive an agent restart belongs in a unit or
@@ -293,6 +336,31 @@ export class Agent {
         [...this.#runners.values()].filter((r) => r.key.startsWith("cmd:")).map((r) => r.stop().catch(() => {})),
       );
     });
+  }
+
+  /**
+   * One runner per process key. A runner is replaced when its spec changed,
+   * except the holder's: those keep their running child, and reconfigure
+   * already refused changes to how the holder runs.
+   */
+  #syncRunners() {
+    const keys = new Set<string>();
+    const held = new Set(this.#holder ? this.service(this.#holder).procs.map((p) => p.key) : []);
+    for (const service of this.#config.services) {
+      for (const proc of service.procs) {
+        keys.add(proc.key);
+        const spec = { ...proc, readyTimeout: service.readyTimeout };
+        const shape = JSON.stringify(spec);
+        if (this.#runnerShapes.get(proc.key) === shape || (held.has(proc.key) && this.#runners.has(proc.key))) continue;
+        this.#runners.set(proc.key, this.deps.runner(spec));
+        this.#runnerShapes.set(proc.key, shape);
+      }
+    }
+    for (const key of this.#runners.keys()) {
+      if (keys.has(key)) continue;
+      this.#runners.delete(key);
+      this.#runnerShapes.delete(key);
+    }
   }
 
   #runnersOf(name: string) {

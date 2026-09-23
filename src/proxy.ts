@@ -1,31 +1,73 @@
 // Per-service reverse proxies. A service with a `proxy` port gets its own
-// listener on the agent's host that forwards to the service URL. The plugin's
+// listener on the agent's host that forwards to the service URL. proxyPool()
+// opens and closes listeners as settings change. The plugin's
 // route() decides per request whether it may wake the service and whether it
 // counts as work. The /v1 router in src/server.ts uses hold() and forward()
 // from here too.
 import { type ClientRequest, type IncomingMessage, type ServerResponse, createServer, request } from "node:http";
 import { request as requestTls } from "node:https";
+import { createServer as createNetServer } from "node:net";
 import type { Duplex } from "node:stream";
 import { type Agent, RefusedError } from "./agent.ts";
-import type { ServiceSpec } from "./config.ts";
 
 /** Largest body kept for replay on a `cached` route. */
 const maxCached = 1024 * 1024;
+/** Most answers kept per proxy, so varied query strings cannot grow memory without bound. */
+const maxEntries = 100;
 
 /**
- * The proxy for one service. Listen on `service.proxy` yourself; close()
- * ends its WebSockets at once and resolves when HTTP requests have finished.
+ * Keeps one proxy listening on `host` per service with a `proxy` port,
+ * following config edits. A port that cannot be opened is logged, not fatal.
  */
-export function createProxy(agent: Agent, service: ServiceSpec) {
-  const { name, url } = service;
-  if (!url) throw new Error(`${name}: proxy needs url`);
+export function proxyPool(agent: Agent, host: string, log: (msg: string) => void) {
+  const listening = new Map<string, { port: number; proxy: Proxy }>();
+  const sync = () => {
+    const want = new Map(agent.config.services.flatMap((s) => (s.proxy === undefined ? [] : [[s.name, s.proxy] as const])));
+    for (const [name, { port, proxy }] of listening) {
+      if (want.get(name) === port) continue;
+      listening.delete(name);
+      void proxy.close();
+    }
+    for (const [name, port] of want) {
+      if (listening.has(name)) continue;
+      const proxy = createProxy(agent, name);
+      proxy.server.on("error", (err) => log(`proxy for ${name} on port ${port}: ${err.message}`));
+      proxy.server.listen(port, host, () => log(`proxy for ${name} on ${host}:${port}`));
+      listening.set(name, { port, proxy });
+    }
+  };
+  sync();
+  const unsubscribe = agent.onConfig(sync);
+  return {
+    servers: () => [...listening.values()].map((p) => p.proxy.server),
+    close() {
+      unsubscribe();
+      return Promise.all([...listening.values()].map((p) => p.proxy.close()));
+    },
+  };
+}
+
+export type Proxy = ReturnType<typeof createProxy>;
+
+/**
+ * The proxy for service `name`. It reads the service's settings per request,
+ * so edits apply at once. Listen on its port yourself; close() ends its
+ * WebSockets at once and resolves when HTTP requests have finished.
+ */
+export function createProxy(agent: Agent, name: string) {
   /** The last 2xx GET answer per path of `cached` routes, replayed while the service is stopped. */
   const cache = new Map<string, { type: string; body: Buffer }>();
   /** Upgraded client sockets. They never count as work and close when the service stops. */
   const sockets = new Set<Duplex>();
-  agent.onStop((stopped) => {
+  let closed = false;
+  const unsubscribe = agent.onStop((stopped) => {
     if (stopped === name) for (const s of sockets) s.destroy();
   });
+  /** The service's current settings, or null once it was removed. Config checks guarantee a url. */
+  const spec = () => {
+    const service = agent.config.services.find((s) => s.name === name);
+    return service?.url ? { ...service, url: service.url } : null;
+  };
 
   const remember = (key: string, req: IncomingMessage, up: IncomingMessage) => {
     const type = up.headers["content-type"];
@@ -40,25 +82,48 @@ export function createProxy(agent: Agent, service: ServiceSpec) {
       if (size <= maxCached) chunks.push(chunk);
     });
     up.once("end", () => {
-      if (size <= maxCached) cache.set(key, { type, body: Buffer.concat(chunks) });
+      if (size > maxCached) return;
+      // Kept in insertion order: a refreshed key moves to the end, the oldest goes first.
+      cache.delete(key);
+      cache.set(key, { type, body: Buffer.concat(chunks) });
+      if (cache.size > maxEntries) cache.delete(cache.keys().next().value ?? "");
     });
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
+    const service = spec();
+    if (!service) return json(res, 404, { error: `${name} was removed` });
     const key = req.url ?? "/";
     const method = req.method ?? "GET";
     const path = new URL(key, "http://x").pathname;
     const route = service.plugin.route({ method, path, accept: req.headers.accept ?? "" });
 
-    if (route === "work" || route === "open") {
+    const cacheable = route === "cached" && method === "GET";
+    // Nothing to replay yet, like a client's model list after the agent started:
+    // a read without credentials wakes the service once and its answer is kept.
+    const firstRead = cacheable && !cache.has(key) && !req.headers.authorization && !req.headers.cookie && !(await agent.running(name));
+    if (route === "work" || route === "open" || firstRead) {
       const release = await hold(agent, name, res);
       if (!release) return;
-      // A page load wakes the service but is not busy for the whole download.
-      return forward(req, res, url, { onResponse: route === "open" ? release : undefined });
+      // Settings may have changed while the request waited; the service started with the new ones.
+      const url = spec()?.url;
+      if (!url) {
+        release();
+        return json(res, 404, { error: `${name} was removed` });
+      }
+      // A page load or a first read wakes the service but is not busy for the whole download.
+      const onResponse = firstRead
+        ? (up: IncomingMessage) => {
+            release();
+            remember(key, req, up);
+          }
+        : route === "open"
+          ? release
+          : undefined;
+      return forward(req, res, url, { onResponse });
     }
-    const cacheable = route === "cached" && method === "GET";
     if (await agent.running(name)) {
-      return forward(req, res, url, { onResponse: cacheable ? (up) => remember(key, req, up) : undefined });
+      return forward(req, res, spec()?.url ?? service.url, { onResponse: cacheable ? (up) => remember(key, req, up) : undefined });
     }
     const hit = cacheable ? cache.get(key) : undefined;
     if (hit) return res.writeHead(200, { "content-type": hit.type, "x-kilnhush-cache": "hit" }).end(hit.body);
@@ -68,10 +133,13 @@ export function createProxy(agent: Agent, service: ServiceSpec) {
   /** Pipes a WebSocket (or any upgrade) through while the service holds the card. */
   const upgrade = async (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     socket.on("error", () => socket.destroy());
-    if (!(await agent.running(name))) return socket.end(rawStatus(503, "Service Unavailable"));
-    if (socket.destroyed) return;
+    // Tracked before waiting, so close() and a service stop reach it.
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
+    const running = await agent.running(name);
+    if (closed || socket.destroyed) return socket.destroy();
+    const url = spec()?.url;
+    if (!url || !running) return socket.end(rawStatus(503, "Service Unavailable"));
 
     const upstream = open(req, url);
     socket.once("close", () => upstream.destroy());
@@ -109,10 +177,21 @@ export function createProxy(agent: Agent, service: ServiceSpec) {
   return {
     server,
     close() {
+      closed = true;
+      unsubscribe();
       for (const s of sockets) s.destroy();
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+/** Whether a listener could open `port` on `host` right now. */
+export function portFree(port: number, host: string) {
+  return new Promise<boolean>((resolve) => {
+    const probe = createNetServer();
+    probe.once("error", () => resolve(false));
+    probe.listen(port, host, () => probe.close(() => resolve(true)));
+  });
 }
 
 /**

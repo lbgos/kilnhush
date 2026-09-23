@@ -3,22 +3,24 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { Server } from "node:http";
+import { connect } from "node:net";
 import { after, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agent } from "../src/agent.ts";
 import { parseConfig } from "../src/config.ts";
 import { fakeComfy, fakeLlama } from "../src/fake.ts";
 import { probeService } from "../src/plugins/index.ts";
-import { createProxy } from "../src/proxy.ts";
+import { proxyPool } from "../src/proxy.ts";
 import type { Runner } from "../src/runners.ts";
 
 // comfy ranks above llm, so a comfy that holds the card refuses llm requests.
-const config = parseConfig(`
+const configText = `
 services:
   - { name: comfy, plugin: comfyui, url: "http://127.0.0.1:29188", proxy: 29189, cmd: [comfy] }
   - { name: llm, plugin: llamacpp, url: "http://127.0.0.1:29080", proxy: 29081, cmd: [llama] }
   - { name: voice, run: always, cmd: [voice] }
-`);
+`;
+const config = parseConfig(configText);
 const comfy = "http://127.0.0.1:29189";
 const llm = "http://127.0.0.1:29081";
 
@@ -46,17 +48,12 @@ const runner = (spec: { key: string; name: string }): Runner => ({
 
 const agent = new Agent(config, { runner, probe: probeService, gpu: async () => null, now: Date.now, sleep, log: () => {} });
 await agent.init();
-const proxies = config.services.flatMap((s) => {
-  if (s.proxy === undefined) return [];
-  const proxy = createProxy(agent, s);
-  proxy.server.listen(s.proxy, "127.0.0.1");
-  return [proxy];
-});
-await Promise.all(proxies.map((p) => once(p.server, "listening")));
+const proxies = proxyPool(agent, "127.0.0.1", () => {});
+await Promise.all(proxies.servers().map((s) => once(s, "listening")));
 
 after(async () => {
   for (const s of servers.values()) s.close();
-  await Promise.all(proxies.map((p) => p.close()));
+  await proxies.close();
 });
 
 test("a passive request to a stopped service gets 503 and wakes nothing", async () => {
@@ -79,12 +76,22 @@ test("a cached route replays its last answer after the service stops", async () 
   const live = await (await fetch(`${llm}/v1/models`)).text();
   await fetch(`${llm}/v1/models?private`, { headers: { authorization: "Bearer secret" } });
   await agent.stop("llm");
-  assert.equal((await fetch(`${llm}/v1/models?private`)).status, 503, "answers behind credentials are not replayed");
+  const hidden = await fetch(`${llm}/v1/models?private`, { headers: { authorization: "Bearer secret" } });
+  assert.equal(hidden.status, 503, "answers behind credentials are not replayed and wake nothing");
   const replay = await fetch(`${llm}/v1/models`);
   assert.equal(replay.headers.get("x-kilnhush-cache"), "hit");
   assert.equal(replay.headers.get("content-type"), "application/json");
   assert.equal(await replay.text(), live);
-  assert.equal((await fetch(`${llm}/props`)).status, 503);
+  assert.equal(agent.holder, null);
+});
+
+test("a first public read with nothing to replay wakes the service once", async () => {
+  const first = await fetch(`${llm}/v1/models?fresh`);
+  assert.equal(first.status, 200);
+  await first.text();
+  assert.equal(agent.holder, "llm");
+  await agent.stop("llm");
+  assert.equal((await fetch(`${llm}/v1/models?fresh`)).headers.get("x-kilnhush-cache"), "hit");
   assert.equal(agent.holder, null);
 });
 
@@ -130,4 +137,13 @@ test("a client that leaves while llm starts does not leak an in-flight request",
   await sleep(500);
   const state = await agent.state();
   assert.deepEqual([state.holder, state.busy, state.risks], ["llm", false, []]);
+});
+
+test("a proxy port moved in settings listens at once, the old one closes", async () => {
+  await agent.reconfigure(() => parseConfig(configText.replace("proxy: 29081", "proxy: 29082")));
+  await Promise.all(proxies.servers().map((s) => (s.listening ? null : once(s, "listening"))));
+  assert.equal((await fetch("http://127.0.0.1:29082/health")).status, 200);
+  // A fresh connection: fetch would reuse its kept-alive socket to the old port.
+  const old = connect(29081, "127.0.0.1");
+  await assert.rejects(once(old, "connect"), /ECONNREFUSED/);
 });

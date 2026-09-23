@@ -36,7 +36,7 @@ function setup(results: ActionResult[], current = state()) {
     assert.ok(next, "unexpected action");
     return next;
   };
-  const agent: AgentClient = { state: async () => current, start: act("start"), stop: act("stop") };
+  const agent: Pick<AgentClient, "state" | "start" | "stop"> = { state: async () => current, start: act("start"), stop: act("stop") };
   return { bot: new Bot(tg, agent, new Set([42]), () => {}), calls, actions };
 }
 
@@ -112,7 +112,7 @@ test("each update is confirmed with Telegram before the bot acts on it", async (
     if (method === "answerCallbackQuery") order.push("answer");
     return true;
   }) as Telegram;
-  const agent: AgentClient = {
+  const agent: Pick<AgentClient, "state" | "start" | "stop"> = {
     state: async () => state({ holder: "voice" }),
     start: async (service, force = false) => {
       order.push(`start ${service} ${force}`);

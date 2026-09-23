@@ -51,7 +51,7 @@ export class Bot {
 
   constructor(
     private tg: Telegram,
-    private agent: AgentClient,
+    private agent: Pick<AgentClient, "state" | "start" | "stop">,
     private users: ReadonlySet<number>,
     private log: (msg: string) => void = console.error,
   ) {}

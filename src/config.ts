@@ -78,7 +78,8 @@ const configSchema = type({
   services: serviceSchema.array(),
 });
 
-export type RawConfig = typeof configSchema.infer;
+/** The config as written, durations still as text. Settings edits work on this form. */
+export type ConfigSource = typeof configSchema.inferIn;
 
 /** Parses and validates config YAML. Throws with every problem listed. */
 export function parseConfig(yamlText: string) {
@@ -89,6 +90,8 @@ export function parseConfig(yamlText: string) {
 export function checkConfig(input: unknown) {
   const raw = configSchema(input);
   if (raw instanceof type.errors) throw new Error(`config: ${raw.summary}`);
+  // Validated just above, so the input has the source shape.
+  const source = structuredClone(input) as ConfigSource;
 
   const problems: string[] = [];
   const warnings: string[] = [];
@@ -203,7 +206,7 @@ export function checkConfig(input: unknown) {
     home: home?.name ?? null,
     warnings,
     /** The validated input, for edits that write the file back. */
-    raw,
+    source,
   };
 }
 

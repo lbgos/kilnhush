@@ -5,11 +5,13 @@ import { type IncomingMessage, type ServerResponse, createServer } from "node:ht
 import { type } from "arktype";
 import { type Agent, BusyError } from "./agent.ts";
 import { forward, hold, json } from "./proxy.ts";
+import { type SettingsDeps, settingsRoute } from "./settings.ts";
 
 const actionBody = type({ service: "string", "force?": "boolean" });
 const maxBody = 64 * 1024 * 1024;
 
-export function createAgentServer(agent: Agent, token?: string) {
+/** Without `settings`, the /api/settings routes answer 404. */
+export function createAgentServer(agent: Agent, token?: string, settings?: SettingsDeps) {
   const modelServices = () => agent.config.services.filter((s) => s.models.length > 0);
 
   const authorized = (req: IncomingMessage) => {
@@ -37,7 +39,15 @@ export function createAgentServer(agent: Agent, token?: string) {
     const service = route(body);
     if (!service?.url) return json(res, 404, { error: "no service serves this model" });
     // hold() releases the card when the response closes.
-    if (await hold(agent, service.name, res)) forward(req, res, service.url, { body });
+    const release = await hold(agent, service.name, res);
+    if (!release) return;
+    // Settings may have changed while the request waited; the service started with the new ones.
+    const url = agent.config.services.find((s) => s.name === service.name)?.url;
+    if (!url) {
+      release();
+      return json(res, 404, { error: `${service.name} was removed` });
+    }
+    forward(req, res, url, { body });
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -48,6 +58,21 @@ export function createAgentServer(agent: Agent, token?: string) {
     if (path.startsWith("/api/")) {
       if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
       if (path === "/api/state" && req.method === "GET") return json(res, 200, await agent.state());
+      if (settings && path.startsWith("/api/settings/")) {
+        const action = path.slice("/api/settings/".length);
+        const read = action === "view" || action === "discover";
+        if (req.method !== (read ? "GET" : "POST")) return json(res, 405, { error: "method not allowed" });
+        let body: unknown = {};
+        if (!read) {
+          try {
+            body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+          } catch {
+            return json(res, 400, { error: "body is not JSON" });
+          }
+        }
+        const result = await settingsRoute(agent, settings, action, body);
+        return json(res, result.status, result.body);
+      }
       if ((path === "/api/start" || path === "/api/stop") && req.method === "POST") {
         let parsed: unknown;
         try {

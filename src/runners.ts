@@ -27,6 +27,23 @@ export function createRunner(spec: RunnerSpec): Runner {
   return command(spec);
 }
 
+/** Whether the host has this unit or container at all, running or not. */
+export async function hostHas(proc: { unit?: string; container?: string }) {
+  try {
+    if (proc.unit) {
+      const { stdout } = await run("systemctl", ["show", "--property=LoadState", "--value", proc.unit], { timeout: 10_000 });
+      return stdout.trim() === "loaded";
+    }
+    if (proc.container) {
+      await run("docker", ["inspect", "--type", "container", "--format", "{{.Id}}", proc.container], { timeout: 10_000 });
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 /**
  * Maps `systemctl is-active` output to running or not. A unit that is
  * starting or stopping still holds the GPU. Anything unrecognized throws:
@@ -76,17 +93,18 @@ export function containerRunning(status: string) {
 
 /** A container the host already has. A missing container throws rather than reading as stopped. */
 function container(spec: RunnerSpec, name: string): Runner {
-  const active = async () => {
-    const { stdout } = await run("docker", ["inspect", "--format", "{{.State.Status}}", name], { timeout: 10_000 });
-    return containerRunning(stdout.trim());
-  };
+  // --type: a volume or image with the same name must not answer instead.
+  const status = async () =>
+    (await run("docker", ["inspect", "--type", "container", "--format", "{{.State.Status}}", name], { timeout: 10_000 })).stdout.trim();
+  const active = async () => containerRunning(await status());
   return {
     key: spec.key,
     name,
     active,
     async start() {
       await run("docker", ["start", name], { timeout: spec.readyTimeout });
-      await waitHealthy(spec.name, spec.health, spec.readyTimeout, active);
+      // A crash-looping container reads as active, but it is not coming up.
+      await waitHealthy(spec.name, spec.health, spec.readyTimeout, async () => (await status()) === "running");
     },
     async stop() {
       await run("docker", ["stop", "--time", "30", name], { timeout: 120_000 });
