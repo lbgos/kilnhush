@@ -20,7 +20,7 @@ modes:
     services: [{ unit: jupyter }]
 `);
 
-function setup({ running = [] as string[], failStart = "", failStop = "", cfg = config } = {}) {
+function setup({ running = [] as string[], failStart = "", failStop = [] as string[], cfg = config } = {}) {
   let now = 1_000_000;
   const active = new Set(running);
   const jupyter: Activity = { busy: false, risks: [], lastActive: 0 };
@@ -36,7 +36,7 @@ function setup({ running = [] as string[], failStart = "", failStop = "", cfg = 
       log.push(`start ${spec.name}`);
     },
     stop: async () => {
-      if (spec.name === failStop) throw new Error(`${spec.name} would not stop`);
+      if (failStop.includes(spec.name)) throw new Error(`${spec.name} would not stop`);
       active.delete(spec.name);
       log.push(`stop ${spec.name}`);
     },
@@ -152,7 +152,7 @@ test("init completes a half-running default mode", async () => {
 });
 
 test("a failed stop keeps the old mode, so recovery does not start voice on top of it", async () => {
-  const t = setup({ running: ["bonsai"], failStop: "bonsai" });
+  const t = setup({ running: ["bonsai"], failStop: ["bonsai"] });
   await t.agent.init();
   await assert.rejects(t.agent.switch("voice"), /would not stop/);
   assert.equal(t.agent.current, "llm");
@@ -170,4 +170,34 @@ modes:
   const t = setup({ running: ["trainer"], cfg });
   await t.agent.init();
   await assert.rejects(t.agent.switch("voice"), (err) => err instanceof BusyError && err.risks[0] === "GPU reading unavailable");
+});
+
+test("if cleanup after a failed start fails, nothing restarts until a forced switch", async () => {
+  const cfg = parseConfig(`
+default: voice
+modes:
+  voice: { services: [{ unit: whisper }] }
+  llm:
+    idle: 20m
+    proxy: { target: http://127.0.0.1:8080 }
+    services: [{ unit: bonsai }, { unit: broken }]
+`);
+  const failStop = ["bonsai"];
+  const t = setup({ cfg, failStart: "broken", failStop });
+  await t.agent.init();
+  await assert.rejects(t.agent.switch("llm"), /broken failed/);
+  assert.ok(t.active.has("bonsai"), "bonsai still holds the GPU");
+
+  await t.agent.tick();
+  assert.ok(!t.active.has("whisper"), "no automatic recovery on top of it");
+  await assert.rejects(t.agent.acquire("llm"), BusyError);
+  await assert.rejects(t.agent.switch("voice"), BusyError);
+  assert.match((await t.agent.state()).risks[0] ?? "", /cleanup after failed llm start/);
+
+  await assert.rejects(t.agent.switch("voice", true), /bonsai would not stop/, "force still refuses to stack modes");
+  failStop.length = 0;
+  await t.agent.switch("voice", true);
+  assert.equal(t.agent.current, "voice");
+  assert.ok(!t.active.has("bonsai"), "the leftover was stopped first");
+  assert.deepEqual((await t.agent.state()).risks, []);
 });

@@ -21,12 +21,29 @@ export function createService(spec: ServiceSpec): Service {
   return spec.unit ? systemdUnit(spec, spec.unit) : command(spec);
 }
 
+/**
+ * Maps `systemctl is-active` output to running or not. A unit that is
+ * starting or stopping still holds the GPU. Anything unrecognized throws:
+ * a failed query must not read as "stopped".
+ */
+export function unitRunning(state: string) {
+  if (state === "inactive" || state === "failed") return false;
+  if (["active", "activating", "deactivating", "reloading", "refreshing"].includes(state)) return true;
+  throw new Error(`unknown unit state ${JSON.stringify(state)}`);
+}
+
 function systemdUnit(spec: ServiceSpec, unit: string): Service {
-  const active = () =>
-    run("systemctl", ["is-active", "--quiet", unit]).then(
-      () => true,
-      () => false,
-    );
+  const active = async () => {
+    let state: string;
+    try {
+      state = (await run("systemctl", ["is-active", unit], { timeout: 10_000 })).stdout;
+    } catch (err) {
+      // is-active exits non-zero for inactive units but still prints the state.
+      state = (err as { stdout?: string }).stdout ?? "";
+      if (!state.trim()) throw new Error(`systemctl is-active ${unit}: ${(err as Error).message}`);
+    }
+    return unitRunning(state.trim());
+  };
   return {
     key: spec.key,
     name: unit,

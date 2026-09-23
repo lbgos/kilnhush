@@ -44,6 +44,8 @@ class Lock {
 export class Agent {
   #current: string | null = null;
   #switching: string | null = null;
+  /** Set when cleanup after a failed start did not finish. Only a forced switch clears it. */
+  #stuck: string | null = null;
   #since = 0;
   #inflight = new Map<string, number>();
   #lastRequest = new Map<string, number>();
@@ -114,6 +116,7 @@ export class Agent {
     return this.#lock.run(async () => {
       const current = this.#current;
       if (current === null) {
+        if (this.#stuck) return;
         await this.#switch(this.config.default, true).catch((err: Error) => this.deps.log(`recover: ${err.message}`));
         return;
       }
@@ -141,6 +144,7 @@ export class Agent {
       await this.#lock.run(async () => {
         const current = this.#current;
         if (current === name) return;
+        if (this.#stuck) throw new BusyError("unknown", [this.#stuck]);
         if (current !== null && current !== this.config.default && !this.mode(current).idle) {
           throw new HeldError(current);
         }
@@ -153,7 +157,9 @@ export class Agent {
 
   async state(): Promise<State> {
     const current = this.#current;
-    const act = current ? await this.#activity(current) : { busy: false, risks: [], lastActive: this.#since };
+    const act = current
+      ? await this.#activity(current)
+      : { busy: false, risks: this.#stuck ? [this.#stuck] : [], lastActive: this.#since };
     const remind = current ? this.mode(current).remind : 0;
     return {
       mode: current,
@@ -227,6 +233,7 @@ export class Agent {
   async #switch(target: string, force: boolean) {
     const from = this.#current;
     if (from === target) return;
+    if (this.#stuck && !force) throw new BusyError("unknown", [this.#stuck]);
     if (from !== null && !force) {
       const act = await this.#activity(from);
       // The await above lets requests start, so read the counter again.
@@ -244,8 +251,12 @@ export class Agent {
     try {
       // If a stop fails, `current` keeps naming the old mode, so recovery
       // never starts the default mode on top of whatever is still running.
-      if (from !== null) {
-        for (const s of this.#servicesOf(from).reverse()) if (!keep.has(s.key)) await s.stop();
+      // With no current mode, whatever still runs is a leftover of a failed
+      // switch. Stop it before starting the target.
+      const old = from !== null ? this.#servicesOf(from).reverse() : [...this.#services.values()];
+      for (const s of old) {
+        if (keep.has(s.key)) continue;
+        if (from !== null || (await s.active())) await s.stop();
       }
     } catch (err) {
       this.#switching = null;
@@ -257,11 +268,21 @@ export class Agent {
     try {
       for (const s of next) await s.start();
       this.#current = target;
+      this.#stuck = null;
       this.#since = this.deps.now();
       this.#event("switch", `${from ?? "none"} → ${target}${force && from !== null ? " (forced)" : ""}`);
     } catch (err) {
       this.#event("fail", `${from ?? "none"} → ${target}: ${(err as Error).message}`);
-      for (const s of [...next].reverse()) await s.stop().catch(() => {});
+      const leftovers: string[] = [];
+      for (const s of [...next].reverse()) {
+        await s.stop().catch((stopErr: Error) => leftovers.push(`${s.name}: ${stopErr.message}`));
+      }
+      // Something may still hold the GPU. Recovering on top of it could run
+      // two modes at once, so wait for a person to force the next switch.
+      if (leftovers.length > 0) {
+        this.#stuck = `cleanup after failed ${target} start did not finish (${leftovers.join("; ")})`;
+        this.#event("fail", this.#stuck);
+      }
       throw err;
     } finally {
       this.#switching = null;

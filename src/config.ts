@@ -37,7 +37,7 @@ const modeSchema = type({
   "remind?": duration,
   /** Treat the mode as busy while GPU utilization is at or above this percent. */
   "gpu_guard?": "0 <= number.integer <= 100",
-  "proxy?": { "+": "reject", target: /^https?:\/\/.+/, "models?": "string[]" },
+  "proxy?": { "+": "reject", target: "string", "models?": "string[]" },
   "jupyter?": { "+": "reject", url: "string.url", "token_env?": "string" },
 });
 
@@ -65,6 +65,10 @@ export function parseConfig(yamlText: string) {
       if (m.idle && !m.proxy) bad("idle needs proxy, idle time is measured from proxied requests");
       if (m.idle && name === raw.default) bad("the default mode cannot have idle");
       if (m.proxy && m.jupyter) bad("proxy and jupyter cannot be combined");
+      if (m.proxy) {
+        const target = URL.parse(m.proxy.target);
+        if (!target || !["http:", "https:"].includes(target.protocol)) bad(`proxy target ${m.proxy.target} is not an http(s) URL`);
+      }
       if (m.proxy && proxyCount > 1 && !m.proxy.models?.length) bad("proxy needs models when several modes proxy");
 
       const services = m.services.map((s, i) => {
@@ -91,6 +95,15 @@ export function parseConfig(yamlText: string) {
       return [name, mode] as const;
     }),
   );
+  // Startup adopts a mode by its running services, so two modes with the
+  // same services would be indistinguishable.
+  const bySet = new Map<string, string>();
+  for (const mode of modes.values()) {
+    const set = [...new Set(mode.services.map((s) => s.key))].sort().join("\n");
+    const other = bySet.get(set);
+    if (other) problems.push(`modes ${other} and ${mode.name} have the same services`);
+    bySet.set(set, mode.name);
+  }
   if (!modes.has(raw.default)) problems.push(`default mode ${raw.default} is not defined`);
   if (problems.length > 0) throw new Error(`config:\n  ${problems.join("\n  ")}`);
 

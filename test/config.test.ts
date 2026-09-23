@@ -34,3 +34,18 @@ test("unknown keys and bad durations are rejected", () => {
   assert.throws(() => parseConfig(`default: v\nmodes: { v: { services: [{ unit: a }], idel: 2m } }`), /idel/);
   assert.throws(() => parseConfig(`default: v\ntick: soon\nmodes: { v: { services: [{ unit: a }] } }`), /duration/);
 });
+
+test("two modes with the same services are rejected, startup could not tell them apart", () => {
+  assert.throws(
+    () => parseConfig(`default: a\nmodes: { a: { services: [{ unit: x }] }, b: { services: [{ unit: x }] } }`),
+    /modes a and b have the same services/,
+  );
+});
+
+test("proxy targets must parse as http(s) URLs", () => {
+  const withTarget = (target: string) =>
+    parseConfig(`default: v\nmodes: { v: { services: [{ unit: a }] }, l: { idle: 1m, proxy: { target: "${target}" }, services: [{ unit: b }] } }`);
+  assert.throws(() => withTarget("http://bad host"), /not an http\(s\) URL/);
+  assert.throws(() => withTarget("ftp://x"), /not an http\(s\) URL/);
+  assert.ok(withTarget("http://127.0.0.1:8080"));
+});
