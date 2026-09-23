@@ -36,16 +36,17 @@ export async function fakeLlama(port: number, { loadMs = 0, replyMs = 500 } = {}
 }
 
 /**
- * Serves /api and /api/sessions with one notebook, train.ipynb.
+ * Serves /api, /api/kernels and /api/sessions with one notebook, train.ipynb.
  * POST /demo?busy=1&tabs=2 sets the kernel state.
  */
 export function fakeJupyter(port: number) {
-  const kernel = { execution_state: "idle", connections: 0, last_activity: new Date().toISOString() };
+  const kernel = { id: "3f2a9c1e-fake", execution_state: "idle", connections: 0, last_activity: new Date().toISOString() };
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://x");
     const json = (body: unknown) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
     if (url.pathname === "/api") return json({ version: "fake" });
-    if (url.pathname === "/api/sessions") return json([{ path: "train.ipynb", kernel }]);
+    if (url.pathname === "/api/kernels") return json([kernel]);
+    if (url.pathname === "/api/sessions") return json([{ path: "train.ipynb", kernel: { id: kernel.id } }]);
     if (url.pathname === "/demo" && req.method === "POST") {
       const busy = url.searchParams.get("busy");
       const tabs = url.searchParams.get("tabs");

@@ -18,42 +18,48 @@ export function mergeActivity(into: Activity, from: Activity) {
   into.lastActive = Math.max(into.lastActive, from.lastActive);
 }
 
-type JupyterSession = {
-  path: string;
-  kernel: { execution_state: string; connections: number; last_activity: string };
-};
+type JupyterKernel = { id: string; execution_state: string; connections: number; last_activity: string };
+type JupyterSession = { path: string; kernel: { id: string } };
 
 /**
- * Reads /api/sessions. A kernel running a cell makes the mode busy. A notebook
- * open in a browser tab is a risk: JupyterLab keeps unsaved edits in the
- * browser, where the server can neither see nor save them. No answer is also
- * a risk, because not knowing is not the same as idle.
+ * Reads /api/kernels and /api/sessions. A kernel running code makes the mode
+ * busy, including kernels started without a session, like remote kernels from
+ * an editor. A kernel with an open connection is a risk: JupyterLab keeps
+ * unsaved edits in the browser, where the server can neither see nor save
+ * them. No answer is also a risk, because not knowing is not the same as idle.
  */
 export async function probeJupyter(spec: JupyterSpec): Promise<Activity> {
   const now = Date.now();
-  const failed = (why: string): Activity => ({ busy: false, risks: [`jupyter ${why}`], lastActive: now });
   const token = spec.tokenEnv ? process.env[spec.tokenEnv] : undefined;
-  let sessions: JupyterSession[];
-  try {
-    const res = await fetch(new URL("api/sessions", spec.url.endsWith("/") ? spec.url : `${spec.url}/`), {
+  const base = spec.url.endsWith("/") ? spec.url : `${spec.url}/`;
+  const get = async <T>(path: string): Promise<T> => {
+    const res = await fetch(new URL(path, base), {
       headers: token ? { authorization: `token ${token}` } : {},
       signal: AbortSignal.timeout(5_000),
     });
-    if (!res.ok) return failed(`answered ${res.status}`);
-    sessions = (await res.json()) as JupyterSession[];
+    if (!res.ok) throw new Error(`${path} answered ${res.status}`);
+    return (await res.json()) as T;
+  };
+
+  let kernels: JupyterKernel[];
+  let sessions: JupyterSession[];
+  try {
+    [kernels, sessions] = await Promise.all([get<JupyterKernel[]>("api/kernels"), get<JupyterSession[]>("api/sessions")]);
   } catch (err) {
-    return failed(`did not answer: ${(err as Error).message}`);
+    return { busy: false, risks: [`jupyter: ${(err as Error).message}`], lastActive: now };
   }
 
+  const paths = new Map(sessions.map((s) => [s.kernel.id, s.path]));
   const act: Activity = { busy: false, risks: [], lastActive: 0 };
-  for (const { path, kernel } of sessions) {
-    act.lastActive = Math.max(act.lastActive, Date.parse(kernel.last_activity) || 0);
-    if (kernel.execution_state === "busy") {
+  for (const k of kernels) {
+    const label = paths.get(k.id) ?? `kernel ${k.id.slice(0, 8)}`;
+    act.lastActive = Math.max(act.lastActive, Date.parse(k.last_activity) || 0);
+    if (k.execution_state === "busy") {
       act.busy = true;
-      act.risks.push(`${path}: cell running`);
+      act.risks.push(`${label}: cell running`);
     }
-    if (kernel.connections > 0) {
-      act.risks.push(`${path}: open in ${kernel.connections} browser tab(s), unsaved edits would be lost`);
+    if (k.connections > 0) {
+      act.risks.push(`${label}: open in ${k.connections} browser tab(s), unsaved edits would be lost`);
     }
   }
   if (act.busy) act.lastActive = now;
