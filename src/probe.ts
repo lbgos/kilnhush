@@ -1,6 +1,7 @@
 // Asks running workloads whether stopping them now would lose work.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { type } from "arktype";
 import type { JupyterSpec } from "./config.ts";
 
 export type Activity = {
@@ -18,8 +19,8 @@ export function mergeActivity(into: Activity, from: Activity) {
   into.lastActive = Math.max(into.lastActive, from.lastActive);
 }
 
-type JupyterKernel = { id: string; execution_state: string; connections: number; last_activity: string };
-type JupyterSession = { path: string; kernel: { id: string } };
+const kernelsSchema = type({ id: "string", execution_state: "string", connections: "number", last_activity: "string" }).array();
+const sessionsSchema = type({ path: "string", kernel: { id: "string" } }).array();
 
 /**
  * Reads /api/kernels and /api/sessions. A kernel running code makes the mode
@@ -32,19 +33,21 @@ export async function probeJupyter(spec: JupyterSpec): Promise<Activity> {
   const now = Date.now();
   const token = spec.tokenEnv ? process.env[spec.tokenEnv] : undefined;
   const base = spec.url.endsWith("/") ? spec.url : `${spec.url}/`;
-  const get = async <T>(path: string): Promise<T> => {
+  const get = async <T>(path: string, schema: (data: unknown) => T | type.errors): Promise<T> => {
     const res = await fetch(new URL(path, base), {
       headers: token ? { authorization: `token ${token}` } : {},
       signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) throw new Error(`${path} answered ${res.status}`);
-    return (await res.json()) as T;
+    const data = schema(await res.json());
+    if (data instanceof type.errors) throw new Error(`${path} sent unexpected JSON: ${data.summary}`);
+    return data;
   };
 
-  let kernels: JupyterKernel[];
-  let sessions: JupyterSession[];
+  let kernels: typeof kernelsSchema.infer;
+  let sessions: typeof sessionsSchema.infer;
   try {
-    [kernels, sessions] = await Promise.all([get<JupyterKernel[]>("api/kernels"), get<JupyterSession[]>("api/sessions")]);
+    [kernels, sessions] = await Promise.all([get("api/kernels", kernelsSchema), get("api/sessions", sessionsSchema)]);
   } catch (err) {
     return { busy: false, risks: [`jupyter: ${(err as Error).message}`], lastActive: now };
   }

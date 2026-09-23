@@ -77,3 +77,34 @@ test("one reminder per idle stretch, and it only asks", async () => {
   assert.equal(t.calls[0]?.body.text, "jupyter idle for 3h00m. voice is off while it runs.");
   assert.deepEqual(t.switches, []);
 });
+
+test("each update is confirmed with Telegram before the bot acts on it", async () => {
+  const controller = new AbortController();
+  const order: string[] = [];
+  const u1 = press("fsw:voice");
+  const u2 = { ...press("st"), update_id: 2 };
+  const polls: Record<string, unknown[]> = { "0/50": [u1, u2], "2/0": [u2], "3/0": [] };
+  const tg = (async (method: string, body: { offset?: number; timeout?: number }) => {
+    if (method === "getUpdates") {
+      const key = `${body.offset}/${body.timeout}`;
+      order.push(`poll ${key}`);
+      if (!(key in polls)) {
+        controller.abort();
+        return [];
+      }
+      return polls[key];
+    }
+    if (method === "answerCallbackQuery") order.push("answer");
+    return true;
+  }) as Telegram;
+  const agent: AgentClient = {
+    state: async () => state({ mode: "voice" }),
+    switch: async (mode, force = false) => {
+      order.push(`switch ${mode} ${force}`);
+      return { ok: true, state: state({ mode }) };
+    },
+  };
+  await new Bot(tg, agent, new Set([42]), () => {}).run(controller.signal);
+  assert.deepEqual(order.slice(0, 4), ["poll 0/50", "poll 2/0", "answer", "switch voice true"]);
+  assert.ok(order.indexOf("poll 3/0") < order.lastIndexOf("answer"), "update 2 confirmed before it was handled");
+});

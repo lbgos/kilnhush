@@ -7,6 +7,9 @@ ExecStart=/usr/bin/node /opt/kilnhush/dist/cli.js agent --config /etc/kilnhush/k
 # KILNHUSH_TOKEN=..., JUPYTER_TOKEN=...
 EnvironmentFile=/etc/kilnhush/env
 Restart=on-failure
+# If the agent dies without cleaning up, systemd kills its whole cgroup,
+# including command services in their own process groups.
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target

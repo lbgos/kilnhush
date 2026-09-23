@@ -127,27 +127,34 @@ export class Bot {
     for (const user of this.users) await this.tg("sendMessage", { chat_id: user, text, reply_markup: keyboard });
   }
 
+  /**
+   * Telegram confirms an update only when a later getUpdates asks for a higher
+   * offset. Each update is confirmed before it is handled, so a bot restart in
+   * the middle of a switch cannot replay a Force button.
+   */
   async run(signal: AbortSignal) {
     const reminders = setInterval(() => this.remind().catch((err: Error) => this.log(`remind: ${err.message}`)), 60_000);
+    const poll = (offset: number, timeout: number) =>
+      this.tg<Update[]>("getUpdates", { offset, timeout, allowed_updates: ["message", "callback_query"] });
     let offset = 0;
+    let pending: Update[] = [];
     try {
       while (!signal.aborted) {
-        let updates: Update[];
+        let update: Update | undefined;
         try {
-          updates = await this.tg<Update[]>("getUpdates", {
-            offset,
-            timeout: 50,
-            allowed_updates: ["message", "callback_query"],
-          });
+          if (pending.length === 0) pending = await poll(offset, 50);
+          update = pending[0];
+          if (!update) continue;
+          // The answer confirms `update` and lists what is still waiting.
+          pending = await poll(update.update_id + 1, 0);
+          offset = update.update_id + 1;
         } catch (err) {
           this.log(`getUpdates: ${(err as Error).message}`);
           await sleep(5_000);
           continue;
         }
-        for (const u of updates) {
-          offset = u.update_id + 1;
-          await this.handle(u).catch((err: Error) => this.log(`update ${u.update_id}: ${err.message}`));
-        }
+        const { update_id } = update;
+        await this.handle(update).catch((err: Error) => this.log(`update ${update_id}: ${err.message}`));
       }
     } finally {
       clearInterval(reminders);

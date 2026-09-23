@@ -43,6 +43,13 @@ test("either endpoint failing is a risk, not idle", async () => {
   assert.match(act.risks[0] ?? "", /api\/sessions answered 500/);
 });
 
+test("unexpected JSON is a risk, not a crash", async () => {
+  const { server, url } = await jupyter({ "/api/kernels": [{ id: 7 }], "/api/sessions": [] });
+  const act = await probeJupyter({ url, tokenEnv: undefined });
+  server.close();
+  assert.match(act.risks[0] ?? "", /api\/kernels sent unexpected JSON/);
+});
+
 test("parseSmi", () => {
   assert.deepEqual(parseSmi("NVIDIA GeForce RTX 3080, 7, 812, 10240\n"), {
     name: "NVIDIA GeForce RTX 3080",

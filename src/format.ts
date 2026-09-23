@@ -15,7 +15,11 @@ const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
 export function formatState(s: State, now = Date.now()) {
   const lines = [
-    s.mode ? `${s.mode} · ${formatDuration(now - s.since)}` : `switching to ${s.switching ?? s.default}…`,
+    s.mode
+      ? `${s.mode} · ${formatDuration(now - s.since)}`
+      : s.switching
+        ? `switching to ${s.switching}…`
+        : "no mode, the last switch failed",
   ];
   if (s.mode) lines.push(s.busy ? "busy" : `idle ${formatDuration(now - s.lastActive)}`);
   if (s.gpu) {

@@ -181,7 +181,9 @@ export class Agent {
   /**
    * Stops services the agent spawned itself; systemd units keep running.
    * Command services are children of the agent and cannot outlive it, so
-   * anything that must survive an agent restart belongs in a unit.
+   * anything that must survive an agent restart belongs in a unit. This runs
+   * on a normal stop. If the agent crashes, its supervisor has to kill the
+   * rest: the example unit uses KillMode=control-group.
    */
   shutdown() {
     // Queue behind a switch in progress, so a command it is starting cannot

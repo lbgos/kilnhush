@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Entry point: `kilnhush agent|bot|status|switch|fake`.
 import { isIP } from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 import { Agent } from "./agent.ts";
 import { agentClient } from "./api.ts";
@@ -56,7 +57,9 @@ async function agent() {
 
   const stop = async () => {
     clearInterval(timer);
-    server.close();
+    // Let proxied responses finish before command services stop, up to 10s.
+    await Promise.race([new Promise((resolve) => server.close(resolve)), sleep(10_000)]);
+    server.closeAllConnections();
     await agent.shutdown();
     process.exit(0);
   };

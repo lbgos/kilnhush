@@ -63,7 +63,7 @@ A service is a systemd `unit` or a `cmd` the agent runs itself. Full example: [`
 
 **Startup.** The agent adopts the mode whose services are running. If what runs matches no single mode, it refuses to start rather than guess.
 
-**Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit.
+**Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit. Run the agent under a supervisor that kills its whole cgroup if it crashes, like the example unit's `KillMode=control-group`.
 
 **Run.** The agent runs as root on the GPU host. The bot runs anywhere that reaches it. Unit files are in [`examples/`](examples).
 
