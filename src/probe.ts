@@ -62,12 +62,12 @@ export async function probeJupyter(spec: JupyterSpec): Promise<Activity> {
 
 export type Gpu = { name: string; util: number; memUsed: number; memTotal: number };
 
-/** Reads the first GPU from nvidia-smi. Null where nvidia-smi is missing or fails. */
-export async function readGpu(): Promise<Gpu | null> {
+/** Reads one GPU from nvidia-smi. Null where nvidia-smi is missing or fails. */
+export async function readGpu(index = 0): Promise<Gpu | null> {
   try {
     const { stdout } = await promisify(execFile)(
       "nvidia-smi",
-      ["--query-gpu=name,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
+      ["-i", String(index), "--query-gpu=name,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
       { timeout: 5_000 },
     );
     return parseSmi(stdout);

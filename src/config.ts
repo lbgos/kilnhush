@@ -46,6 +46,8 @@ const configSchema = type({
   "listen?": "string",
   default: "string",
   "tick?": duration,
+  /** nvidia-smi index of the GPU this agent manages. */
+  "gpu?": "number.integer >= 0",
   modes: { "[string]": modeSchema },
 });
 
@@ -92,7 +94,7 @@ export function parseConfig(yamlText: string) {
   if (!modes.has(raw.default)) problems.push(`default mode ${raw.default} is not defined`);
   if (problems.length > 0) throw new Error(`config:\n  ${problems.join("\n  ")}`);
 
-  return { listen: raw.listen ?? "127.0.0.1:7340", default: raw.default, tick: raw.tick ?? 10_000, modes };
+  return { listen: raw.listen ?? "127.0.0.1:7340", default: raw.default, tick: raw.tick ?? 10_000, gpu: raw.gpu ?? 0, modes };
 }
 
 export function loadConfig(path: string) {

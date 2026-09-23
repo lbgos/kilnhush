@@ -48,7 +48,7 @@ async function agent() {
   const loopback = host === "localhost" || host === "::1" || (isIP(host) === 4 && host.startsWith("127."));
   if (!loopback && !token) throw new Error(`listening on ${config.listen} needs KILNHUSH_TOKEN`);
 
-  const agent = new Agent(config, { service: createService, jupyter: probeJupyter, gpu: readGpu, now: Date.now, log });
+  const agent = new Agent(config, { service: createService, jupyter: probeJupyter, gpu: () => readGpu(config.gpu), now: Date.now, log });
   await agent.init();
   const server = createAgentServer(agent, token);
   server.listen(Number(url.port), host, () => log(`listening on ${config.listen}, mode ${agent.current}`));

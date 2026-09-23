@@ -1,10 +1,20 @@
 # kilnhush
 
-A small GPU mode switcher for a homelab, with a Telegram bot on top.
+A mode switcher for people with one GPU and more services than VRAM.
 
-I have one RTX 3080 with 10 GB and more things that want it than fit. Whisper and Kokoro run Home Assistant voice. A 27B model wakes when something asks for it. JupyterLab takes the whole card when I train. These can't share 10 GB, so the card switches between modes. That used to be three scripts that didn't know about each other, and one of them killed my notebook when it stopped Jupyter.
+Say you run speech-to-text for Home Assistant, a local LLM your coding agent calls, and sometimes a notebook to train something. Each one fits on the card alone. Together they don't. So you write scripts that stop one thing to start another, and one day a script stops Jupyter three hours into a training run.
 
-kilnhush is one agent per GPU host and one bot. The rule it enforces is small. Before stopping a mode, ask whether that loses work. If it does, don't stop unless told twice.
+kilnhush puts one agent in front of the card. You group services into modes, and one mode owns the GPU at a time. An LLM mode wakes on the first API request and steps aside once nobody uses it. A mode that holds real work, like Jupyter, never stops on a timer. It also never stops while something is running, unless you say so twice. A Telegram bot shows what holds the card and switches modes from your phone.
+
+## A day with it
+
+- **08:00** Voice mode. Whisper and Kokoro answer Home Assistant.
+- **10:15** Your coding agent sends a request to `/v1/chat/completions`. kilnhush stops voice, starts the 27B model and forwards the request once the model is up. The agent just sees a slow first answer.
+- **10:40** Twenty minutes without requests. The model goes away, voice comes back.
+- **14:00** You tap `jupyter` in Telegram and start a training run.
+- **16:30** The coding agent asks the model again. It gets `503 GPU is held by jupyter mode`, and your run keeps going.
+- **17:00** You tap `voice` by accident. The bot says a cell is running and `train.ipynb` is open in a browser tab, and shows a Force button. You don't press it.
+- **23:00** Training ended at 19:00 and nothing happened since. The bot asks once whether to give the card back to voice.
 
 ```text
 $ kilnhush switch voice
@@ -13,6 +23,12 @@ jupyter is busy:
 - train.ipynb: open in 1 browser tab(s), unsaved edits would be lost
 rerun with --force to stop it anyway
 ```
+
+Two cards on one host work too. Run one agent per GPU, each with its own config, port and `gpu:` index, and pin each unit to its card with `CUDA_VISIBLE_DEVICES`.
+
+## Why I built it
+
+My box has an RTX 3080 with 10 GB: voice for Home Assistant, Bonsai 27B for agents, JupyterLab for training. Before kilnhush that was three scripts that knew nothing about each other, and one of them stopped Jupyter with unsaved work in it. That setup is `examples/vm111.yaml`.
 
 ## How it decides
 
@@ -66,7 +82,7 @@ The llm mode returns to voice 30s after its last request. The agent prints every
 
 ## Config
 
-`examples/vm111.yaml` is my real host:
+`examples/vm111.yaml`, the 3080 box from above:
 
 ```yaml
 listen: 0.0.0.0:7340
@@ -105,7 +121,7 @@ Services a mode shares with the next one keep running through the switch. If a m
 
 ## Run it
 
-The agent runs as root on the GPU host, so it can drive `systemctl`. The bot can run anywhere that reaches the agent. Mine runs on a small always-on container, so it still answers when the GPU VM is down.
+The agent runs as root on the GPU host, so it can drive `systemctl`. The bot can run anywhere that reaches the agent. Put it on something always on, like a small container, so it still answers when the GPU machine is down.
 
 | Env | Used by | Meaning |
 |---|---|---|
@@ -120,7 +136,7 @@ Set JupyterLab's autosave interval low. The server can't save a notebook that is
 
 ## Not in scope
 
-It does not share one GPU between several models by priority. [GridCore](https://www.youtube.com/watch?v=Mu3xzCVoHXc) and llama-swap work on that. On a 10 GB card my modes can't run together anyway. The hard part is knowing when stopping one is safe.
+It does not share one GPU between several models by priority, the way [GridCore](https://www.youtube.com/watch?v=Mu3xzCVoHXc) does. llama-swap swaps models on a timer but doesn't know about notebooks or other services. kilnhush is for the case where your modes can't fit together anyway. The hard part is knowing when stopping one is safe.
 
 ## Development
 
