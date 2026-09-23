@@ -6,16 +6,6 @@ Say you run speech-to-text for Home Assistant, a local LLM your coding agent cal
 
 kilnhush puts one agent in front of the card. You group services into modes, and one mode owns the GPU at a time. An LLM mode wakes on the first API request and steps aside once nobody uses it. A mode that holds real work, like Jupyter, never stops on a timer. It also never stops while something is running, unless you say so twice. A Telegram bot shows what holds the card and switches modes from your phone.
 
-## A day with it
-
-- **08:00** Voice mode. Whisper and Kokoro answer Home Assistant.
-- **10:15** Your coding agent sends a request to `/v1/chat/completions`. kilnhush stops voice, starts the 27B model and forwards the request once the model is up. The agent just sees a slow first answer.
-- **10:40** Twenty minutes without requests. The model goes away, voice comes back.
-- **14:00** You tap `jupyter` in Telegram and start a training run.
-- **16:30** The coding agent asks the model again. It gets `503 GPU is held by jupyter mode`, and your run keeps going.
-- **17:00** You tap `voice` by accident. The bot says a cell is running and `train.ipynb` is open in a browser tab, and shows a Force button. You don't press it.
-- **23:00** Training ended at 19:00 and nothing happened since. The bot asks once whether to give the card back to voice.
-
 ```text
 $ kilnhush switch voice
 jupyter is busy:
@@ -23,8 +13,6 @@ jupyter is busy:
 - train.ipynb: open in 1 browser tab(s), unsaved edits would be lost
 rerun with --force to stop it anyway
 ```
-
-Two cards on one host work too. Run one agent per GPU, each with its own config, port and `gpu:` index, and pin each unit to its card with `CUDA_VISIBLE_DEVICES`.
 
 ## Why I built it
 
@@ -115,7 +103,7 @@ modes:
         health: http://127.0.0.1:8888/api
 ```
 
-The loader rejects unknown keys. It also rejects `idle` on a mode without `proxy`, since nothing would measure that idle time. With several proxied modes, each lists its `models`, and the agent routes by the request's `model` field. `/v1/models` answers from config, so listing models doesn't wake anything.
+The loader rejects unknown keys. It also rejects `idle` on a mode without `proxy`, since nothing would measure that idle time. With several proxied modes, each lists its `models`, and the agent routes by the request's `model` field. `/v1/models` answers from config, so listing models doesn't wake anything. `gpu:` sets which `nvidia-smi` index the status reads, default 0.
 
 Services a mode shares with the next one keep running through the switch. If a mode fails to start, the agent stops what it started and brings the default mode back on the next tick.
 
