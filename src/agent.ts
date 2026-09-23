@@ -46,6 +46,7 @@ export class Agent {
   #switching: string | null = null;
   /** Set when cleanup after a failed start did not finish. Only a forced switch clears it. */
   #stuck: string | null = null;
+  #closing = false;
   #since = 0;
   #inflight = new Map<string, number>();
   #lastRequest = new Map<string, number>();
@@ -115,6 +116,7 @@ export class Agent {
   tick() {
     return this.#lock.run(async () => {
       const current = this.#current;
+      if (this.#closing) return;
       if (current === null) {
         if (this.#stuck) return;
         await this.#switch(this.config.default, true).catch((err: Error) => this.deps.log(`recover: ${err.message}`));
@@ -181,15 +183,20 @@ export class Agent {
    * Command services are children of the agent and cannot outlive it, so
    * anything that must survive an agent restart belongs in a unit.
    */
-  async shutdown() {
-    const current = this.#current;
-    if (current) {
-      const { risks } = await this.#activity(current);
-      if (risks.length > 0) this.deps.log(`shutdown stops ${current} command services despite: ${risks.join("; ")}`);
-    }
-    await Promise.all(
-      [...this.#services.values()].filter((s) => s.key.startsWith("cmd:")).map((s) => s.stop().catch(() => {})),
-    );
+  shutdown() {
+    // Queue behind a switch in progress, so a command it is starting cannot
+    // outlive the agent. Switches queued after this one refuse to run.
+    this.#closing = true;
+    return this.#lock.run(async () => {
+      const current = this.#current;
+      if (current) {
+        const { risks } = await this.#activity(current);
+        if (risks.length > 0) this.deps.log(`shutdown stops ${current} command services despite: ${risks.join("; ")}`);
+      }
+      await Promise.all(
+        [...this.#services.values()].filter((s) => s.key.startsWith("cmd:")).map((s) => s.stop().catch(() => {})),
+      );
+    });
   }
 
   #servicesOf(name: string) {
@@ -231,6 +238,7 @@ export class Agent {
 
   /** Must run inside the lock. */
   async #switch(target: string, force: boolean) {
+    if (this.#closing) throw new Error("agent is shutting down");
     const from = this.#current;
     if (from === target) return;
     if (this.#stuck && !force) throw new BusyError("unknown", [this.#stuck]);

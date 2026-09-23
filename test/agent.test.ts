@@ -20,7 +20,7 @@ modes:
     services: [{ unit: jupyter }]
 `);
 
-function setup({ running = [] as string[], failStart = "", failStop = [] as string[], cfg = config } = {}) {
+function setup({ running = [] as string[], failStart = "", failStop = [] as string[], cfg = config, startMs = 0 } = {}) {
   let now = 1_000_000;
   const active = new Set(running);
   const jupyter: Activity = { busy: false, risks: [], lastActive: 0 };
@@ -32,6 +32,7 @@ function setup({ running = [] as string[], failStart = "", failStop = [] as stri
     start: async () => {
       if (spec.name === failStart) throw new Error(`${spec.name} failed`);
       if (active.has(spec.name)) return; // like systemctl start on an active unit
+      await new Promise((resolve) => setTimeout(resolve, startMs));
       active.add(spec.name);
       log.push(`start ${spec.name}`);
     },
@@ -200,4 +201,25 @@ modes:
   assert.equal(t.agent.current, "voice");
   assert.ok(!t.active.has("bonsai"), "the leftover was stopped first");
   assert.deepEqual((await t.agent.state()).risks, []);
+});
+
+test("shutdown waits for a switch in progress and stops what it started", async () => {
+  const cfg = parseConfig(`
+default: voice
+modes:
+  voice: { services: [{ cmd: [voice] }] }
+  llm:
+    idle: 20m
+    proxy: { target: http://127.0.0.1:8080 }
+    services: [{ cmd: [llm] }]
+`);
+  const t = setup({ cfg, startMs: 50 });
+  await t.agent.init();
+  const switching = t.agent.switch("llm");
+  await new Promise((resolve) => setTimeout(resolve, 10)); // llm is mid-start
+  await t.agent.shutdown();
+  await switching;
+  assert.deepEqual(t.log, ["start voice", "stop voice", "start llm", "stop voice", "stop llm"], "shutdown ran after the start finished");
+  assert.ok(!t.active.has("llm"));
+  await assert.rejects(t.agent.switch("voice"), /shutting down/);
 });
