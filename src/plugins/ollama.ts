@@ -19,6 +19,8 @@ export const ollama: Plugin = {
     cmdline: /(^|\/)ollama\s+serve(\s|$)/,
   },
   route({ method, path }) {
+    // Model details: clients like Open WebUI post here to render lists, not to generate.
+    if (method === "POST" && path === "/api/show") return "passive";
     if (isWrite(method)) return "work";
     return method === "GET" && cached.has(path) ? "cached" : "passive";
   },

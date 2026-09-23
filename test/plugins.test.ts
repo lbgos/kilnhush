@@ -69,7 +69,7 @@ test("a1111 probe sends basic auth and reads job_count", async () => {
       req.headers.authorization === `Basic ${Buffer.from("u:p").toString("base64")}`;
     res.writeHead(ok ? 200 : 401).end(JSON.stringify({ progress: 0, state: { job_count: jobs } }));
   };
-  assert.equal((await probe("a1111", progress(1), "u:p")).busy, true);
+  assert.deepEqual((await probe("a1111", progress(1), "u:p")).risks, ["1 image job(s) running or queued"]);
   assert.deepEqual(await probe("a1111", progress(0), "u:p"), idle);
   assert.match((await probe("a1111", progress(0))).risks[0] ?? "", /^a1111: .* answered 401/);
 });
@@ -101,6 +101,7 @@ test("route classes", () => {
     ["ollama", "GET", "/", "text/html", "cached"],
     ["ollama", "HEAD", "/", "*/*", "passive"],
     ["ollama", "GET", "/api/ps", "*/*", "passive"],
+    ["ollama", "POST", "/api/show", "*/*", "passive"],
     ["llamacpp", "POST", "/completion", "*/*", "work"],
     ["llamacpp", "GET", "/props", "*/*", "cached"],
     ["llamacpp", "GET", "/", "text/html,application/xhtml+xml", "open"],
@@ -115,6 +116,7 @@ test("route classes", () => {
     ["comfyui", "GET", "/queue", "*/*", "passive"],
     ["a1111", "POST", "/sdapi/v1/txt2img", "*/*", "work"],
     ["a1111", "GET", "/sdapi/v1/progress", "*/*", "passive"],
+    ["a1111", "POST", "/internal/progress", "*/*", "passive"],
     ["jupyter", "POST", "/api/kernels", "*/*", "passive"],
     ["jupyter", "GET", "/lab", "text/html", "passive"],
     ["wyoming", "POST", "/", "*/*", "passive"],
