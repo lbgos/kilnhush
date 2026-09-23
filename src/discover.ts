@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { Plugin } from "./plugins/types.ts";
-import { containerRunning, unitRunning } from "./services.ts";
+import { containerRunning, unitRunning } from "./runners.ts";
 
 export type Owner = { kind: "unit" | "container"; name: string };
 export type GpuProcess = { pid: number; usedMiB: number; owner: Owner | null; cmdline: string };

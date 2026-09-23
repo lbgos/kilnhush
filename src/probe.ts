@@ -1,8 +1,6 @@
 // Asks running workloads whether stopping them now would lose work.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { JupyterSpec } from "./config.ts";
-import { probeKernels } from "./plugins/jupyter.ts";
 
 export type Activity = {
   /** Work is running at this moment. */
@@ -17,11 +15,6 @@ export function mergeActivity(into: Activity, from: Activity) {
   into.busy ||= from.busy;
   into.risks.push(...from.risks);
   into.lastActive = Math.max(into.lastActive, from.lastActive);
-}
-
-/** Probes the Jupyter server of a v0.1 mode, with the token read from `tokenEnv`. */
-export function probeJupyter(spec: JupyterSpec): Promise<Activity> {
-  return probeKernels({ url: spec.url, token: spec.tokenEnv ? process.env[spec.tokenEnv] : undefined });
 }
 
 export type Gpu = { name: string; util: number; memUsed: number; memTotal: number };

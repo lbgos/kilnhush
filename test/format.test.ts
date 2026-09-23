@@ -4,10 +4,13 @@ import type { State } from "../src/api.ts";
 import { formatState } from "../src/format.ts";
 
 const base: State = {
-  mode: null,
+  holder: null,
   switching: null,
-  default: "voice",
-  modes: ["voice"],
+  home: "voice",
+  homePaused: false,
+  pinned: false,
+  services: [{ name: "voice", plugin: "Custom", run: "always", idle: 0, proxy: null, models: [] }],
+  warnings: [],
   since: 0,
   busy: false,
   risks: [],
@@ -18,6 +21,7 @@ const base: State = {
 };
 
 test("a failed switch does not look like one in progress", () => {
-  assert.match(formatState({ ...base, switching: "llm" }), /^switching to llm…/);
-  assert.match(formatState({ ...base, risks: ["cleanup after failed llm start did not finish"] }), /^no mode, the last switch failed\n! cleanup/);
+  assert.match(formatState({ ...base, switching: "llm" }), /^starting llm…/);
+  assert.match(formatState({ ...base, risks: ["cleanup after failed llm start did not finish"] }), /^no service, the last switch failed\n! cleanup/);
+  assert.match(formatState({ ...base, homePaused: true }), /^card free, home stopped by hand\n\n○ voice · always on$/);
 });

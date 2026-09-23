@@ -4,10 +4,10 @@ Switch one GPU between services that don't fit in VRAM together, without killing
 
 - An LLM wakes on its first `/v1/*` request and gives the card back when idle.
 - Jupyter only stops by hand, and not while a cell runs or a notebook is open.
-- A Telegram bot shows what holds the card and switches modes.
+- A Telegram bot shows what holds the card and starts or stops services.
 
 ```text
-$ kilnhush switch voice
+$ kilnhush stop jupyter
 jupyter is busy:
 - train.ipynb: cell running
 - train.ipynb: open in 1 browser tab(s), unsaved edits would be lost
@@ -24,44 +24,45 @@ node dist/cli.js agent --config examples/demo.yaml
 
 # another terminal
 curl -s localhost:7340/v1/chat/completions -d '{}'   # wakes llm
-node dist/cli.js switch jupyter
+node dist/cli.js start jupyter
 curl -s -X POST 'localhost:18888/demo?busy=1&tabs=1'
-node dist/cli.js switch voice                        # refused
-node dist/cli.js switch voice --force
+node dist/cli.js stop jupyter                        # refused
+node dist/cli.js stop jupyter --force                # voice comes back
 ```
 
 ## Config
 
+Services in priority order, first matters most:
+
 ```yaml
-default: voice
-modes:
-  voice:
-    services:
-      - unit: wyoming-faster-whisper.service
-        health: tcp://127.0.0.1:10300
-  bonsai:
-    idle: 20m                        # back to voice after 20 min without requests
-    proxy: { target: http://127.0.0.1:8080 }
-    services:
-      - unit: bonsai-3080.service
-        health: http://127.0.0.1:8080/health
-  jupyter:
-    remind: 3h                       # the bot asks, it never stops it
-    gpu_guard: 20                    # busy while GPU utilization >= 20%
-    jupyter: { url: http://127.0.0.1:8888, token_env: JUPYTER_TOKEN }
-    services:
-      - unit: jupyter-3080.service
+services:
+  - name: jupyter
+    plugin: jupyter
+    run: manual                      # only by hand; the bot asks after 3h idle
+    remind: 3h
+    unit: jupyter-3080.service
+  - name: bonsai
+    plugin: llamacpp                 # on_demand: wakes on /v1 requests, stops after idle
+    idle: 20m
+    models: [bonsai]
+    unit: bonsai-3080.service
+  - name: voice
+    plugin: wyoming
+    run: always                      # runs whenever the card is free
+    unit: wyoming-faster-whisper.service
 ```
 
-A service is a systemd `unit`, a docker `container`, or a `cmd` the agent runs itself. Full example: [`examples/vm111.yaml`](examples/vm111.yaml), my RTX 3080 with Home Assistant voice, Bonsai 27B and JupyterLab.
+A service runs as a systemd `unit`, a docker `container`, a `cmd` the agent runs itself, or a `group` of those. Plugins (`ollama`, `llamacpp`, `vllm`, `comfyui`, `a1111`, `jupyter`, `wyoming`, `custom`) know each program's port, health check and how to tell it is busy. Full example: [`examples/vm111.yaml`](examples/vm111.yaml), my RTX 3080 with Home Assistant voice, Bonsai 27B and JupyterLab.
 
 ## Details
 
-**What blocks a switch.** A proxied request in flight, a kernel running a cell, a notebook open in a browser tab, GPU utilization over `gpu_guard`, or a probe that got no answer. `--force` or the bot's Force button overrides it.
+**Who gets the card.** A request takes the card from a lower-ranked service once that one has nothing running. It waits up to `wait` (60s) for running work to finish, and never takes the card from a higher-ranked or manual service: it gets a 503 with `Retry-After`. A service started by hand keeps the card until it idles out once.
 
-**Proxy.** `/v1/*` routes by the request's `model` when several modes proxy. `/v1/models` answers from config and wakes nothing. While a manual mode holds the card, requests get 503.
+**What blocks a stop.** A proxied request in flight, a kernel running a cell, a notebook open in a browser tab, a queued ComfyUI prompt, a running A1111 render, GPU utilization over `gpu_guard`, or a probe that got no answer. `--force` or the bot's Force button overrides it.
 
-**Startup.** The agent adopts the mode whose services are running. If what runs matches no single mode, it refuses to start rather than guess.
+**Proxy.** `/v1/*` routes by the request's `model`. `/v1/models` answers from config and wakes nothing.
+
+**Startup.** The agent adopts the service whose processes are running. If what runs matches no single service, it refuses to start rather than guess.
 
 **Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit. Run the agent under a supervisor that kills its whole cgroup if it crashes, like the example unit's `KillMode=control-group`.
 

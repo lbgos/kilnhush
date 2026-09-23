@@ -1,13 +1,16 @@
-// Starts and stops the things a mode is made of: systemd units and docker
-// containers the host already has, or commands the agent runs as its own
-// children.
+// Starts and stops the processes a service is made of: systemd units and
+// docker containers the host already has, or commands the agent runs as its
+// own children.
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { connect } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
-import type { ServiceSpec } from "./config.ts";
+import type { ProcSpec } from "./config.ts";
 
-export interface Service {
+/** One process of a service, with how long a start may take. */
+export type RunnerSpec = ProcSpec & { readyTimeout: number };
+
+export interface Runner {
   readonly key: string;
   readonly name: string;
   /** Resolves once the service is healthy. */
@@ -18,7 +21,7 @@ export interface Service {
 
 const run = promisify(execFile);
 
-export function createService(spec: ServiceSpec): Service {
+export function createRunner(spec: RunnerSpec): Runner {
   if (spec.unit) return systemdUnit(spec, spec.unit);
   if (spec.container) return container(spec, spec.container);
   return command(spec);
@@ -35,7 +38,7 @@ export function unitRunning(state: string) {
   throw new Error(`unknown unit state ${JSON.stringify(state)}`);
 }
 
-function systemdUnit(spec: ServiceSpec, unit: string): Service {
+function systemdUnit(spec: RunnerSpec, unit: string): Runner {
   const active = async () => {
     let state: string;
     try {
@@ -53,7 +56,7 @@ function systemdUnit(spec: ServiceSpec, unit: string): Service {
     active,
     async start() {
       await run("systemctl", ["start", unit], { timeout: spec.readyTimeout });
-      await waitReady(spec, active);
+      await waitHealthy(spec.name, spec.health, spec.readyTimeout, active);
     },
     async stop() {
       await run("systemctl", ["stop", unit], { timeout: 120_000 });
@@ -72,7 +75,7 @@ export function containerRunning(status: string) {
 }
 
 /** A container the host already has. A missing container throws rather than reading as stopped. */
-function container(spec: ServiceSpec, name: string): Service {
+function container(spec: RunnerSpec, name: string): Runner {
   const active = async () => {
     const { stdout } = await run("docker", ["inspect", "--format", "{{.State.Status}}", name], { timeout: 10_000 });
     return containerRunning(stdout.trim());
@@ -83,7 +86,7 @@ function container(spec: ServiceSpec, name: string): Service {
     active,
     async start() {
       await run("docker", ["start", name], { timeout: spec.readyTimeout });
-      await waitReady(spec, active);
+      await waitHealthy(spec.name, spec.health, spec.readyTimeout, active);
     },
     async stop() {
       await run("docker", ["stop", "--time", "30", name], { timeout: 120_000 });
@@ -92,7 +95,7 @@ function container(spec: ServiceSpec, name: string): Service {
 }
 
 /** Runs `cmd` in its own process group, so stop() also ends its children. */
-function command(spec: ServiceSpec): Service {
+function command(spec: RunnerSpec): Runner {
   const [file, ...args] = spec.cmd;
   let child: ChildProcess | null = null;
   const running = () => child !== null && child.exitCode === null && child.signalCode === null;
@@ -111,7 +114,7 @@ function command(spec: ServiceSpec): Service {
         });
         child = proc;
       }
-      await waitReady(spec, async () => running());
+      await waitHealthy(spec.name, spec.health, spec.readyTimeout, async () => running());
     },
     async stop() {
       const pgid = child?.pid;
@@ -150,12 +153,13 @@ async function groupGone(pgid: number, timeoutMs: number) {
   }
 }
 
-async function waitReady(spec: ServiceSpec, alive: () => Promise<boolean>) {
-  const deadline = Date.now() + spec.readyTimeout;
+/** Polls `health` until it passes, `alive` turns false, or `timeoutMs` runs out. */
+export async function waitHealthy(name: string, health: string | undefined, timeoutMs: number, alive: () => Promise<boolean>) {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (!(await alive())) throw new Error(`${spec.name} is not running`);
-    if (!spec.health || (await healthy(spec.health))) return;
-    if (Date.now() > deadline) throw new Error(`${spec.name} not healthy after ${spec.readyTimeout / 1000}s`);
+    if (!(await alive())) throw new Error(`${name} is not running`);
+    if (!health || (await healthy(health))) return;
+    if (Date.now() > deadline) throw new Error(`${name} not healthy after ${timeoutMs / 1000}s`);
     await sleep(500);
   }
 }

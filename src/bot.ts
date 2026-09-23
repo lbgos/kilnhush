@@ -1,8 +1,9 @@
-// Telegram front for one agent. Any message gets a status card with a button
-// per mode. A busy mode gets a second, explicit "force" button instead of a
-// silent stop. Idle reminders are questions; the bot never switches on its own.
+// Telegram front for one agent. Any message gets a status card with a start
+// or stop button per service. A busy service gets a second, explicit "force"
+// button instead of a silent stop. Idle reminders are questions; the bot never
+// stops anything on its own.
 import { setTimeout as sleep } from "node:timers/promises";
-import type { AgentClient, State } from "./api.ts";
+import type { ActionResult, AgentClient, State } from "./api.ts";
 import { formatDuration, formatState } from "./format.ts";
 
 type Button = { text: string; callback_data: string };
@@ -35,13 +36,14 @@ export function telegram(token: string, baseUrl = "https://api.telegram.org"): T
   };
 }
 
-function modeKeyboard(s: State): Keyboard {
-  return {
-    inline_keyboard: [
-      s.modes.map((m) => ({ text: m === s.mode ? `✓ ${m}` : m, callback_data: `sw:${m}` })),
-      [{ text: "Refresh", callback_data: "st" }],
-    ],
-  };
+/** Callback data: `go:<service>` starts, `halt:<service>` stops, an `f` prefix forces, `st` refreshes. */
+function statusKeyboard(s: State): Keyboard {
+  const buttons = s.services.map((svc) =>
+    svc.name === s.holder ? { text: `■ ${svc.name}`, callback_data: `halt:${svc.name}` } : { text: `▶ ${svc.name}`, callback_data: `go:${svc.name}` },
+  );
+  const rows: Button[][] = [];
+  for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+  return { inline_keyboard: [...rows, [{ text: "Refresh", callback_data: "st" }]] };
 }
 
 export class Bot {
@@ -59,7 +61,7 @@ export class Bot {
     if (msg) {
       if (!msg.from || !this.users.has(msg.from.id)) return this.log(`ignored message from ${msg.from?.id}`);
       const s = await this.agent.state();
-      await this.tg("sendMessage", { chat_id: msg.chat.id, text: formatState(s), reply_markup: modeKeyboard(s) });
+      await this.tg("sendMessage", { chat_id: msg.chat.id, text: formatState(s), reply_markup: statusKeyboard(s) });
       return;
     }
 
@@ -76,52 +78,52 @@ export class Bot {
         if (!err.message.includes("not modified")) throw err;
       });
 
-    const [action, mode] = cb.data.split(":");
-    if (action === "st" || !mode) {
+    const [action = "", service] = cb.data.split(":");
+    const force = action.startsWith("f");
+    const verb = force ? action.slice(1) : action;
+    if (!service || (verb !== "go" && verb !== "halt")) {
       await this.tg("answerCallbackQuery", { callback_query_id: cb.id });
       const s = await this.agent.state();
-      await edit(formatState(s), modeKeyboard(s));
+      await edit(formatState(s), statusKeyboard(s));
       return;
     }
 
-    const force = action === "fsw";
-    await this.tg("answerCallbackQuery", { callback_query_id: cb.id, text: `switching to ${mode}…` });
-    await edit(`switching to ${mode}…`);
-    const result = await this.agent.switch(mode, force);
+    const doing = verb === "go" ? `starting ${service}…` : `stopping ${service}…`;
+    await this.tg("answerCallbackQuery", { callback_query_id: cb.id, text: doing });
+    await edit(doing);
+    const result: ActionResult = verb === "go" ? await this.agent.start(service, force) : await this.agent.stop(service, force);
     if (result.ok) {
-      await edit(formatState(result.state), modeKeyboard(result.state));
+      await edit(formatState(result.state), statusKeyboard(result.state));
     } else if ("busy" in result) {
-      const { risks } = result.busy;
+      const label = verb === "go" ? `Force start ${service}` : `Force stop ${service}`;
       await edit(
         [
-          `${result.busy.mode} is busy:`,
-          ...risks.map((r) => `- ${r}`),
+          `${result.busy.service} is busy:`,
+          ...result.busy.risks.map((r) => `- ${r}`),
           "",
-          "Force stops it anyway. Running cells die and unsaved edits are lost.",
+          "Force stops it anyway. Running work dies and unsaved edits are lost.",
         ].join("\n"),
         {
-          inline_keyboard: [
-            [{ text: `Force → ${mode}`, callback_data: `fsw:${mode}` }],
-            [{ text: "Cancel", callback_data: "st" }],
-          ],
+          inline_keyboard: [[{ text: label, callback_data: `f${verb}:${service}` }], [{ text: "Cancel", callback_data: "st" }]],
         },
       );
     } else {
       const s = await this.agent.state();
-      await edit(`${formatState(s)}\n\nerror: ${result.error}`, modeKeyboard(s));
+      await edit(`${formatState(s)}\n\nerror: ${result.error}`, statusKeyboard(s));
     }
   }
 
   /** Sends one question per idle stretch. Answering it is the user's call. */
   async remind(now = Date.now()) {
     const s = await this.agent.state();
-    if (!s.reminderDue || !s.mode) return;
-    const key = `${s.mode}:${s.lastActive}`;
+    if (!s.reminderDue || !s.holder) return;
+    const key = `${s.holder}:${s.lastActive}`;
     if (key === this.#lastReminder) return;
     this.#lastReminder = key;
-    const text = `${s.mode} idle for ${formatDuration(now - s.lastActive)}. ${s.default} is off while it runs.`;
+    const waiting = s.home && s.home !== s.holder ? ` ${s.home} is off while it runs.` : "";
+    const text = `${s.holder} idle for ${formatDuration(now - s.lastActive)}.${waiting}`;
     const keyboard: Keyboard = {
-      inline_keyboard: [[{ text: `Switch to ${s.default}`, callback_data: `sw:${s.default}` }], [{ text: "Status", callback_data: "st" }]],
+      inline_keyboard: [[{ text: `Stop ${s.holder}`, callback_data: `halt:${s.holder}` }], [{ text: "Status", callback_data: "st" }]],
     };
     // Private chats: the chat id equals the user id.
     for (const user of this.users) await this.tg("sendMessage", { chat_id: user, text, reply_markup: keyboard });

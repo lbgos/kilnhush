@@ -1,5 +1,6 @@
 // Plain-text status shared by the bot and the CLI.
 import type { State } from "./api.ts";
+import type { Run } from "./plugins/types.ts";
 
 /** 75_000 → "1m15s", 11_520_000 → "3h12m". */
 export function formatDuration(ms: number) {
@@ -11,17 +12,25 @@ export function formatDuration(ms: number) {
   return `${s}s`;
 }
 
+/** How each run setting reads to a person. */
+export const runLabel: Record<Run, string> = {
+  on_demand: "when used",
+  always: "always on",
+  manual: "by hand",
+};
+
 const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
+function headline(s: State, now: number) {
+  if (s.holder) return `${s.holder} · ${formatDuration(now - s.since)}`;
+  if (s.switching) return `starting ${s.switching}…`;
+  if (s.risks.length > 0) return "no service, the last switch failed";
+  return s.homePaused ? "card free, home stopped by hand" : "card free";
+}
+
 export function formatState(s: State, now = Date.now()) {
-  const lines = [
-    s.mode
-      ? `${s.mode} · ${formatDuration(now - s.since)}`
-      : s.switching
-        ? `switching to ${s.switching}…`
-        : "no mode, the last switch failed",
-  ];
-  if (s.mode) lines.push(s.busy ? "busy" : `idle ${formatDuration(now - s.lastActive)}`);
+  const lines = [headline(s, now)];
+  if (s.holder) lines.push(s.busy ? "busy" : `idle ${formatDuration(now - s.lastActive)}`);
   if (s.gpu) {
     const { name, util, memUsed, memTotal } = s.gpu;
     const filled = Math.round((memUsed / Math.max(memTotal, 1)) * 16);
@@ -29,6 +38,11 @@ export function formatState(s: State, now = Date.now()) {
     lines.push(`${name} ${util}%`, `${"█".repeat(filled)}${"░".repeat(16 - filled)} ${gb(memUsed)}/${gb(memTotal)} GB`);
   }
   for (const risk of s.risks) lines.push(`! ${risk}`);
+  lines.push("");
+  for (const svc of s.services) {
+    const port = svc.proxy ? ` · :${svc.proxy}` : "";
+    lines.push(`${svc.name === s.holder ? "●" : "○"} ${svc.name} · ${runLabel[svc.run]}${port}`);
+  }
   if (s.events.length > 0) {
     lines.push("");
     for (const e of s.events.slice(0, 5)) lines.push(`${clock(e.at)} ${e.kind} ${e.text}`);
