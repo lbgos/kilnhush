@@ -1,0 +1,13 @@
+[Unit]
+Description=kilnhush Telegram bot
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/kilnhush/dist/cli.js bot
+# KILNHUSH_AGENT=http://192.168.30.131:7340, KILNHUSH_TOKEN, KILNHUSH_TG_TOKEN, KILNHUSH_TG_USERS
+EnvironmentFile=/etc/kilnhush/bot.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

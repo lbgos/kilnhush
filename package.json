@@ -1,0 +1,30 @@
+{
+  "name": "kilnhush",
+  "version": "0.1.0",
+  "description": "GPU mode switcher for a homelab, with a Telegram bot.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "kilnhush": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "packageManager": "pnpm@10.24.0",
+  "dependencies": {
+    "arktype": "^2.2.3",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

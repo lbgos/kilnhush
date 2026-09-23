@@ -1,0 +1,23 @@
+# Runs anywhere: fake llama-server and Jupyter, `sleep` standing in for voice.
+# Build first (`pnpm build`), then `node dist/cli.js agent --config examples/demo.yaml`.
+listen: 127.0.0.1:7340
+default: voice
+tick: 2s
+modes:
+  voice:
+    services:
+      - cmd: [sleep, infinity]
+  llm:
+    idle: 30s
+    proxy:
+      target: http://127.0.0.1:18080
+    services:
+      - cmd: [node, dist/cli.js, fake, llama, --port, "18080", --load-ms, "3000"]
+        health: http://127.0.0.1:18080/health
+  jupyter:
+    remind: 1m
+    jupyter:
+      url: http://127.0.0.1:18888
+    services:
+      - cmd: [node, dist/cli.js, fake, jupyter, --port, "18888"]
+        health: http://127.0.0.1:18888/api

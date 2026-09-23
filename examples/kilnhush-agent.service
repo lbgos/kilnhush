@@ -1,0 +1,12 @@
+[Unit]
+Description=kilnhush GPU mode agent
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/node /opt/kilnhush/dist/cli.js agent --config /etc/kilnhush/kilnhush.yaml
+# KILNHUSH_TOKEN=..., JUPYTER_TOKEN=...
+EnvironmentFile=/etc/kilnhush/env
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
