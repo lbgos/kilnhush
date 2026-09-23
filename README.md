@@ -1,10 +1,10 @@
 # kilnhush
 
-A mode switcher for people with one GPU and more services than VRAM.
+Switch one GPU between services that don't fit in VRAM together, without killing work that is still running.
 
-Say you run speech-to-text for Home Assistant, a local LLM your coding agent calls, and sometimes a notebook to train something. Each one fits on the card alone. Together they don't. So you write scripts that stop one thing to start another, and one day a script stops Jupyter three hours into a training run.
-
-kilnhush puts one agent in front of the card. You group services into modes, and one mode owns the GPU at a time. An LLM mode wakes on the first API request and steps aside once nobody uses it. A mode that holds real work, like Jupyter, never stops on a timer. It also never stops while something is running, unless you say so twice. A Telegram bot shows what holds the card and switches modes from your phone.
+- An LLM wakes on its first `/v1/*` request and gives the card back when idle.
+- Jupyter only stops by hand, and not while a cell runs or a notebook is open.
+- A Telegram bot shows what holds the card and switches modes.
 
 ```text
 $ kilnhush switch voice
@@ -14,126 +14,70 @@ jupyter is busy:
 rerun with --force to stop it anyway
 ```
 
-## Why I built it
+## Try it
 
-My box has an RTX 3080 with 10 GB: voice for Home Assistant, Bonsai 27B for agents, JupyterLab for training. Before kilnhush that was three scripts that knew nothing about each other, and one of them stopped Jupyter with unsaved work in it. That setup is `examples/vm111.yaml`.
-
-## How it decides
-
-A mode is a list of services. A service is a systemd unit the host already has, or a command the agent runs itself. One mode owns the GPU at a time.
-
-| Mode kind | Starts | Stops |
-|---|---|---|
-| default (`voice`) | at boot, and whenever nothing else runs | when another mode is asked for |
-| with `proxy` + `idle` (`bonsai`) | on the first `/v1/*` request | after `idle` with no requests in flight |
-| manual (`jupyter`) | from the bot or `kilnhush switch` | from the bot or CLI, never on a timer |
-
-Before a switch, the agent probes the current mode. Each risk it finds blocks the switch:
-
-- a request still in flight through the proxy
-- a Jupyter kernel running a cell
-- a notebook open in a browser tab. JupyterLab keeps unsaved edits in the browser, and the server can't see them or save them.
-- GPU utilization over `gpu_guard`, for training started from a terminal instead of a notebook
-- Jupyter not answering, because not knowing is not the same as idle
-
-A blocked switch returns the risks. The bot shows them with a separate Force button. After a manual mode has been idle for `remind`, the bot asks once whether to stop it. It never stops it on its own.
-
-A request for the LLM while Jupyter holds the card gets a 503 with `GPU is held by jupyter mode`. It does not wake anything.
-
-## Demo
-
-This runs anywhere. It uses a fake llama-server, a fake Jupyter and `sleep` as voice. You need Node 22.18 or newer and pnpm.
+Runs anywhere with Node 22.18+ and pnpm. The demo uses a fake llama-server and a fake Jupyter.
 
 ```bash
-pnpm install
-pnpm build
+pnpm install && pnpm build
 node dist/cli.js agent --config examples/demo.yaml
-```
 
-In another terminal:
-
-```bash
-node dist/cli.js status
-
-# Wakes the llm mode. The fake model takes 3s to load.
-curl -s localhost:7340/v1/chat/completions -d '{"messages":[]}'
-
+# another terminal
+curl -s localhost:7340/v1/chat/completions -d '{}'   # wakes llm
 node dist/cli.js switch jupyter
-curl -s -X POST 'localhost:18888/demo?busy=1&tabs=1'   # a cell runs, a tab is open
-
-curl -s localhost:7340/v1/chat/completions -d '{}'     # 503, jupyter holds the GPU
-node dist/cli.js switch voice                          # refused, lists both risks
+curl -s -X POST 'localhost:18888/demo?busy=1&tabs=1'
+node dist/cli.js switch voice                        # refused
 node dist/cli.js switch voice --force
 ```
 
-The llm mode returns to voice 30s after its last request. The agent prints every decision, and `/api/state` keeps the last 20.
-
 ## Config
 
-`examples/vm111.yaml`, the 3080 box from above:
-
 ```yaml
-listen: 0.0.0.0:7340
 default: voice
 modes:
   voice:
     services:
       - unit: wyoming-faster-whisper.service
         health: tcp://127.0.0.1:10300
-      - unit: wyoming-kokoro.service
-        health: tcp://127.0.0.1:10800
-      - unit: qwen35-3080.service
-        health: http://127.0.0.1:8080/health
   bonsai:
-    idle: 20m
-    proxy:
-      target: http://127.0.0.1:8080
+    idle: 20m                        # back to voice after 20 min without requests
+    proxy: { target: http://127.0.0.1:8080 }
     services:
       - unit: bonsai-3080.service
         health: http://127.0.0.1:8080/health
-        ready_timeout: 3m
   jupyter:
-    remind: 3h
-    gpu_guard: 20
-    jupyter:
-      url: http://127.0.0.1:8888
-      token_env: JUPYTER_TOKEN
+    remind: 3h                       # the bot asks, it never stops it
+    gpu_guard: 20                    # busy while GPU utilization >= 20%
+    jupyter: { url: http://127.0.0.1:8888, token_env: JUPYTER_TOKEN }
     services:
       - unit: jupyter-3080.service
-        health: http://127.0.0.1:8888/api
 ```
 
-The loader rejects unknown keys. It also rejects `idle` on a mode without `proxy`, since nothing would measure that idle time. With several proxied modes, each lists its `models`, and the agent routes by the request's `model` field. `/v1/models` answers from config, so listing models doesn't wake anything. `gpu:` sets which `nvidia-smi` index the status reads, default 0.
+A service is a systemd `unit` or a `cmd` the agent runs itself. Full example: [`examples/vm111.yaml`](examples/vm111.yaml), my RTX 3080 with Home Assistant voice, Bonsai 27B and JupyterLab.
 
-Services a mode shares with the next one keep running through the switch. If a mode fails to start, the agent stops what it started and brings the default mode back on the next tick.
+## Details
 
-## Run it
+**What blocks a switch.** A proxied request in flight, a kernel running a cell, a notebook open in a browser tab, GPU utilization over `gpu_guard`, or a probe that got no answer. `--force` or the bot's Force button overrides it.
 
-The agent runs as root on the GPU host, so it can drive `systemctl`. The bot can run anywhere that reaches the agent. Put it on something always on, like a small container, so it still answers when the GPU machine is down.
+**Proxy.** `/v1/*` routes by the request's `model` when several modes proxy. `/v1/models` answers from config and wakes nothing. While a manual mode holds the card, requests get 503.
 
-| Env | Used by | Meaning |
-|---|---|---|
-| `KILNHUSH_TOKEN` | agent, bot, CLI | bearer token for `/api/*`. The agent refuses to listen beyond loopback without it |
-| `KILNHUSH_AGENT` | bot, CLI | agent URL, default `http://127.0.0.1:7340` |
-| `KILNHUSH_TG_TOKEN` | bot | Telegram bot token |
-| `KILNHUSH_TG_USERS` | bot | comma-separated Telegram user ids. Everyone else is ignored |
+**Startup.** The agent adopts the mode whose services are running. If what runs matches no single mode, it refuses to start rather than guess.
 
-Unit files are in `examples/`. `/v1/*` is open without a token, like llama-server itself, so keep the port on your LAN.
+**Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit.
 
-Set JupyterLab's autosave interval low. The server can't save a notebook that is still open in a browser, so frequent autosave is the only guard against unsaved edits. In Settings → Document Manager, set `autosaveInterval` to 30.
+**Run.** The agent runs as root on the GPU host. The bot runs anywhere that reaches it. Unit files are in [`examples/`](examples).
 
-## Not in scope
+| Env | Meaning |
+|---|---|
+| `KILNHUSH_TOKEN` | bearer token for `/api/*`, required unless the agent listens on loopback |
+| `KILNHUSH_AGENT` | agent URL for bot and CLI, default `http://127.0.0.1:7340` |
+| `KILNHUSH_TG_TOKEN` | Telegram bot token |
+| `KILNHUSH_TG_USERS` | comma-separated Telegram user ids allowed to use the bot |
 
-It does not share one GPU between several models by priority, the way [GridCore](https://www.youtube.com/watch?v=Mu3xzCVoHXc) does. llama-swap swaps models on a timer but doesn't know about notebooks or other services. kilnhush is for the case where your modes can't fit together anyway. The hard part is knowing when stopping one is safe.
+`/v1/*` has no auth, same as llama-server. Keep it on your LAN.
 
 ## Development
 
-TypeScript on Node, no framework. The only dependencies are `arktype` for config and request validation and `yaml`.
-
-```bash
-pnpm check   # typecheck, tests, build
-```
-
-The tests run the real agent, proxy and Jupyter probe against the fakes. Only process management is stubbed.
+TypeScript on Node. Dependencies: `arktype`, `yaml`. `pnpm check` runs typecheck, tests and build.
 
 [MIT](LICENSE)

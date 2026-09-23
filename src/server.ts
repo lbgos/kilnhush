@@ -1,7 +1,7 @@
 // HTTP front of the agent: the control API under /api and an OpenAI-compatible
 // proxy under /v1 that wakes the mode serving the requested model.
 import { timingSafeEqual } from "node:crypto";
-import { type IncomingMessage, type ServerResponse, createServer, request } from "node:http";
+import { type ClientRequest, type IncomingMessage, type ServerResponse, createServer, request } from "node:http";
 import { request as requestTls } from "node:https";
 import { type } from "arktype";
 import { type Agent, BusyError, HeldError } from "./agent.ts";
@@ -36,24 +36,38 @@ export function createAgentServer(agent: Agent, token?: string) {
     const mode = route(body);
     if (!mode?.proxy) return json(res, 404, { error: "no mode serves this model" });
 
-    let release: () => void;
+    // Listen for the client leaving before acquire(): a mode can take
+    // minutes to start, and a missed close would leak the in-flight count.
+    let release: (() => void) | undefined;
+    let upstream: ClientRequest | undefined;
+    let clientGone = false;
+    res.once("close", () => {
+      clientGone = true;
+      release?.();
+      // A client that hangs up mid-stream should stop the generation too.
+      if (!res.writableFinished) upstream?.destroy();
+    });
+
     try {
       release = await agent.acquire(mode.name);
     } catch (err) {
       const status = err instanceof HeldError || err instanceof BusyError ? 503 : 502;
       return json(res, status, { error: (err as Error).message });
     }
+    if (clientGone) return release();
 
-    const target = new URL(req.url ?? "/", mode.proxy.target);
-    const send = target.protocol === "https:" ? requestTls : request;
-    const upstream = send(target, { method: req.method, headers: { ...req.headers, host: target.host } });
-    res.once("close", () => {
+    try {
+      const target = new URL(req.url ?? "/", mode.proxy.target);
+      const send = target.protocol === "https:" ? requestTls : request;
+      upstream = send(target, { method: req.method, headers: { ...req.headers, host: target.host } });
+    } catch (err) {
       release();
-      // A client that hangs up mid-stream should stop the generation too.
-      if (!res.writableFinished) upstream.destroy();
-    });
+      return json(res, 502, { error: (err as Error).message });
+    }
     upstream.once("response", (up) => {
       res.writeHead(up.statusCode ?? 502, up.headers);
+      up.once("error", () => res.destroy());
+      up.once("aborted", () => res.destroy());
       up.pipe(res);
     });
     upstream.once("error", (err) => {

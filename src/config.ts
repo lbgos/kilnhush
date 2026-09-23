@@ -37,7 +37,7 @@ const modeSchema = type({
   "remind?": duration,
   /** Treat the mode as busy while GPU utilization is at or above this percent. */
   "gpu_guard?": "0 <= number.integer <= 100",
-  "proxy?": { "+": "reject", target: "string.url", "models?": "string[]" },
+  "proxy?": { "+": "reject", target: /^https?:\/\/.+/, "models?": "string[]" },
   "jupyter?": { "+": "reject", url: "string.url", "token_env?": "string" },
 });
 

@@ -20,7 +20,7 @@ modes:
     services: [{ unit: jupyter }]
 `);
 
-function setup({ running = [] as string[], failStart = "" } = {}) {
+function setup({ running = [] as string[], failStart = "", failStop = "", cfg = config } = {}) {
   let now = 1_000_000;
   const active = new Set(running);
   const jupyter: Activity = { busy: false, risks: [], lastActive: 0 };
@@ -31,15 +31,17 @@ function setup({ running = [] as string[], failStart = "" } = {}) {
     active: async () => active.has(spec.name),
     start: async () => {
       if (spec.name === failStart) throw new Error(`${spec.name} failed`);
+      if (active.has(spec.name)) return; // like systemctl start on an active unit
       active.add(spec.name);
       log.push(`start ${spec.name}`);
     },
     stop: async () => {
+      if (spec.name === failStop) throw new Error(`${spec.name} would not stop`);
       active.delete(spec.name);
       log.push(`stop ${spec.name}`);
     },
   });
-  const agent = new Agent(config, {
+  const agent = new Agent(cfg, {
     service,
     jupyter: async () => structuredClone(jupyter),
     gpu: async () => null,
@@ -134,4 +136,38 @@ test("a failed switch cleans up and the next tick restores voice", async () => {
     state.events.map((e) => e.kind),
     ["switch", "fail", "switch"],
   );
+});
+
+test("init refuses to guess when two modes run at once", async () => {
+  const t = setup({ running: ["jupyter", "bonsai"] });
+  await assert.rejects(t.agent.init(), /unclear GPU state/);
+  assert.deepEqual(t.log, [], "nothing was stopped or started");
+});
+
+test("init completes a half-running default mode", async () => {
+  const t = setup({ running: ["whisper"] });
+  await t.agent.init();
+  assert.equal(t.agent.current, "voice");
+  assert.deepEqual(t.log, ["start kokoro"]);
+});
+
+test("a failed stop keeps the old mode, so recovery does not start voice on top of it", async () => {
+  const t = setup({ running: ["bonsai"], failStop: "bonsai" });
+  await t.agent.init();
+  await assert.rejects(t.agent.switch("voice"), /would not stop/);
+  assert.equal(t.agent.current, "llm");
+  await t.agent.tick();
+  assert.ok(!t.active.has("whisper"));
+});
+
+test("gpu_guard without a GPU reading blocks the switch", async () => {
+  const cfg = parseConfig(`
+default: voice
+modes:
+  voice: { services: [{ unit: whisper }] }
+  train: { gpu_guard: 20, services: [{ unit: trainer }] }
+`);
+  const t = setup({ running: ["trainer"], cfg });
+  await t.agent.init();
+  await assert.rejects(t.agent.switch("voice"), (err) => err instanceof BusyError && err.risks[0] === "GPU reading unavailable");
 });

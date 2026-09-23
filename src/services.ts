@@ -64,18 +64,40 @@ function command(spec: ServiceSpec): Service {
       await waitReady(spec, async () => running());
     },
     async stop() {
-      const proc = child;
-      if (!proc?.pid || !running()) return;
-      const exited = new Promise((resolve) => proc.once("exit", resolve));
-      process.kill(-proc.pid, "SIGTERM");
-      const done = await Promise.race([exited.then(() => true), sleep(15_000, false)]);
-      if (!done) {
-        process.kill(-proc.pid, "SIGKILL");
-        await exited;
+      const pgid = child?.pid;
+      if (!pgid) return;
+      // The leader exiting is not enough: a child that ignores SIGTERM can
+      // keep holding VRAM. Wait for the whole group to go.
+      signalGroup(pgid, "SIGTERM");
+      if (!(await groupGone(pgid, 15_000))) {
+        signalGroup(pgid, "SIGKILL");
+        if (!(await groupGone(pgid, 5_000))) throw new Error(`${spec.name}: process group ${pgid} survived SIGKILL`);
       }
       child = null;
     },
   };
+}
+
+function signalGroup(pgid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(-pgid, signal);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+  }
+}
+
+async function groupGone(pgid: number, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(-pgid, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw err;
+    }
+    if (Date.now() > deadline) return false;
+    await sleep(100);
+  }
 }
 
 async function waitReady(spec: ServiceSpec, alive: () => Promise<boolean>) {

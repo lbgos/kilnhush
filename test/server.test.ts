@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { Agent } from "../src/agent.ts";
 import { agentClient } from "../src/api.ts";
 import { parseConfig } from "../src/config.ts";
@@ -28,11 +29,13 @@ modes:
 `);
 
 const servers = new Map<string, Server>();
+let llamaStartMs = 0;
 const service = (spec: { key: string; name: string }): Service => ({
   key: spec.key,
   name: spec.name,
   active: async () => spec.name === "voice" || servers.has(spec.name),
   async start() {
+    if (spec.name === "llama") await sleep(llamaStartMs);
     if (spec.name === "llama") servers.set("llama", await fakeLlama(llamaPort, { replyMs: 50 }));
     if (spec.name === "jupyter") servers.set("jupyter", await fakeJupyter(jupyterPort));
   },
@@ -102,4 +105,16 @@ test("jupyter with a busy kernel refuses, force stops it, chat gets 503 meanwhil
   assert.ok(forced.ok);
   assert.equal(forced.state.mode, "voice");
   assert.equal(forced.state.events[0]?.text, "jupyter → voice (forced)");
+});
+
+test("a client that leaves while the model loads does not leak an in-flight request", async () => {
+  llamaStartMs = 300;
+  await assert.rejects(
+    fetch(`${base}/v1/chat/completions`, { method: "POST", body: "{}", signal: AbortSignal.timeout(50) }),
+  );
+  await sleep(500);
+  const state = await client.state();
+  assert.equal(state.mode, "llm");
+  assert.equal(state.busy, false);
+  assert.deepEqual(state.risks, []);
 });

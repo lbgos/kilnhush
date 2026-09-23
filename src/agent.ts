@@ -72,20 +72,31 @@ export class Agent {
     return mode;
   }
 
-  /** Adopts a mode that is already fully running, else starts the default one. */
+  /**
+   * Adopts the mode whose services are exactly the ones running. Starts the
+   * default mode when only (some of) its services run. Anything else, like
+   * two modes at once or half of a manual mode, throws: the agent will not
+   * guess which work is safe to stop.
+   */
   init() {
     return this.#lock.run(async () => {
-      const names = [...this.config.modes.keys()].filter((n) => n !== this.config.default);
-      for (const name of [...names, this.config.default]) {
-        const states = await Promise.all(this.#servicesOf(name).map((s) => s.active()));
-        if (states.every(Boolean)) {
+      const all = [...this.#services.values()];
+      const states = await Promise.all(all.map((s) => s.active()));
+      const running = new Set(all.filter((_, i) => states[i]).map((s) => s.key));
+      const keysOf = (name: string) => new Set(this.mode(name).services.map((s) => s.key));
+
+      for (const name of this.config.modes.keys()) {
+        const keys = keysOf(name);
+        if (running.size > 0 && keys.size === running.size && [...running].every((k) => keys.has(k))) {
           this.#current = name;
           this.#since = this.deps.now();
           this.#event("switch", `found ${name} running`);
           return;
         }
       }
-      await this.#switch(this.config.default, true);
+      const defaults = keysOf(this.config.default);
+      if ([...running].every((k) => defaults.has(k))) return this.#switch(this.config.default, true);
+      throw new Error(`unclear GPU state, running: ${[...running].join(", ")}. Stop the extra services by hand.`);
     });
   }
 
@@ -124,7 +135,9 @@ export class Agent {
    */
   async acquire(name: string): Promise<() => void> {
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (this.#current === name) return this.#begin(name);
+      // While a switch away from `name` stops its services, `current` still
+      // names it; new requests must wait for the switch instead.
+      if (this.#current === name && this.#switching === null) return this.#begin(name);
       await this.#lock.run(async () => {
         const current = this.#current;
         if (current === name) return;
@@ -157,8 +170,17 @@ export class Agent {
     };
   }
 
-  /** Stops services the agent spawned itself. systemd units keep running. */
+  /**
+   * Stops services the agent spawned itself; systemd units keep running.
+   * Command services are children of the agent and cannot outlive it, so
+   * anything that must survive an agent restart belongs in a unit.
+   */
   async shutdown() {
+    const current = this.#current;
+    if (current) {
+      const { risks } = await this.#activity(current);
+      if (risks.length > 0) this.deps.log(`shutdown stops ${current} command services despite: ${risks.join("; ")}`);
+    }
     await Promise.all(
       [...this.#services.values()].filter((s) => s.key.startsWith("cmd:")).map((s) => s.stop().catch(() => {})),
     );
@@ -192,7 +214,9 @@ export class Agent {
     if (mode.jupyter) mergeActivity(act, await this.deps.jupyter(mode.jupyter));
     if (mode.gpuGuard > 0) {
       const gpu = await this.deps.gpu();
-      if (gpu && gpu.util >= mode.gpuGuard) {
+      if (!gpu) {
+        mergeActivity(act, { busy: false, risks: ["GPU reading unavailable"], lastActive: now });
+      } else if (gpu.util >= mode.gpuGuard) {
         mergeActivity(act, { busy: true, risks: [`GPU at ${gpu.util}%`], lastActive: now });
       }
     }
@@ -214,14 +238,23 @@ export class Agent {
       }
     }
 
-    this.#current = null;
     this.#switching = target;
     const next = this.#servicesOf(target);
     const keep = new Set(next.map((s) => s.key));
     try {
+      // If a stop fails, `current` keeps naming the old mode, so recovery
+      // never starts the default mode on top of whatever is still running.
       if (from !== null) {
         for (const s of this.#servicesOf(from).reverse()) if (!keep.has(s.key)) await s.stop();
       }
+    } catch (err) {
+      this.#switching = null;
+      this.#event("fail", `stopping ${from}: ${(err as Error).message}`);
+      throw err;
+    }
+
+    this.#current = null;
+    try {
       for (const s of next) await s.start();
       this.#current = target;
       this.#since = this.deps.now();
