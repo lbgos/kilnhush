@@ -1,10 +1,10 @@
 // HTTP front of the agent: the control API under /api and an OpenAI-compatible
 // proxy under /v1 that wakes the service serving the requested model.
 import { timingSafeEqual } from "node:crypto";
-import { type ClientRequest, type IncomingMessage, type ServerResponse, createServer, request } from "node:http";
-import { request as requestTls } from "node:https";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { type } from "arktype";
-import { type Agent, BusyError, RefusedError } from "./agent.ts";
+import { type Agent, BusyError } from "./agent.ts";
+import { forward, hold, json } from "./proxy.ts";
 
 const actionBody = type({ service: "string", "force?": "boolean" });
 const maxBody = 64 * 1024 * 1024;
@@ -36,50 +36,8 @@ export function createAgentServer(agent: Agent, token?: string) {
     const body = await readBody(req);
     const service = route(body);
     if (!service?.url) return json(res, 404, { error: "no service serves this model" });
-
-    // Listen for the client leaving before acquire(): a service can take
-    // minutes to start, and a missed close would leak the in-flight count.
-    let release: (() => void) | undefined;
-    let upstream: ClientRequest | undefined;
-    let clientGone = false;
-    res.once("close", () => {
-      clientGone = true;
-      release?.();
-      // A client that hangs up mid-stream should stop the generation too.
-      if (!res.writableFinished) upstream?.destroy();
-    });
-
-    try {
-      release = await agent.acquire(service.name);
-    } catch (err) {
-      if (err instanceof RefusedError) {
-        const headers: Record<string, string> = err.retryAfter ? { "retry-after": String(err.retryAfter) } : {};
-        return json(res, 503, { error: err.message }, headers);
-      }
-      return json(res, 502, { error: (err as Error).message });
-    }
-    if (clientGone) return release();
-
-    try {
-      const target = new URL(req.url ?? "/", service.url);
-      const send = target.protocol === "https:" ? requestTls : request;
-      // No pooled sockets: one from before a restart would fail with ECONNRESET.
-      upstream = send(target, { method: req.method, headers: { ...req.headers, host: target.host }, agent: false });
-    } catch (err) {
-      release();
-      return json(res, 502, { error: (err as Error).message });
-    }
-    upstream.once("response", (up) => {
-      res.writeHead(up.statusCode ?? 502, up.headers);
-      up.once("error", () => res.destroy());
-      up.once("aborted", () => res.destroy());
-      up.pipe(res);
-    });
-    upstream.once("error", (err) => {
-      if (res.headersSent) res.destroy();
-      else json(res, 502, { error: err.message });
-    });
-    upstream.end(body);
+    // hold() releases the card when the response closes.
+    if (await hold(agent, service.name, res)) forward(req, res, service.url, { body });
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -130,11 +88,6 @@ export function createAgentServer(agent: Agent, token?: string) {
       else json(res, 500, { error: err.message });
     });
   });
-}
-
-function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
-  res.writeHead(status, { ...headers, "content-type": "application/json" });
-  res.end(JSON.stringify(body));
 }
 
 async function readBody(req: IncomingMessage) {

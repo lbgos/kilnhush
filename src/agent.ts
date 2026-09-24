@@ -69,6 +69,7 @@ export class Agent {
   #events: AgentEvent[] = [];
   #lock = new Lock();
   #runners = new Map<string, Runner>();
+  #stopListeners: ((name: string) => void)[] = [];
 
   constructor(
     config: Config,
@@ -222,6 +223,22 @@ export class Agent {
     } finally {
       if (waiting) this.#waiting.set(name, (this.#waiting.get(name) ?? 1) - 1);
     }
+  }
+
+  /**
+   * Whether `name` holds the card with no switch in progress, for requests
+   * that must not wake it. While the card is switching to `name`, answers
+   * once that switch is done, so requests right after a page load that woke
+   * the service get through. The switch is bounded by the runners' timeouts.
+   */
+  async running(name: string): Promise<boolean> {
+    if (this.#switching === name) await this.#lock.run(async () => {});
+    return this.#holder === name && !this.#gate;
+  }
+
+  /** Calls `fn` with a service's name each time its processes have stopped. */
+  onStop(fn: (name: string) => void) {
+    this.#stopListeners.push(fn);
   }
 
   async state(): Promise<State> {
@@ -379,6 +396,7 @@ export class Agent {
       }
 
       this.#holder = null;
+      if (from !== null) for (const fn of this.#stopListeners) fn(from);
       if (target === null) {
         this.#event("stop", `${from}${forced}`);
         return;

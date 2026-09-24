@@ -12,6 +12,7 @@ import { formatState } from "./format.ts";
 import { readGpu } from "./probe.ts";
 import { createAgentServer } from "./server.ts";
 import { probeService } from "./plugins/index.ts";
+import { createProxy } from "./proxy.ts";
 import { createRunner } from "./runners.ts";
 
 const usage = `kilnhush agent  --config kilnhush.yaml     run on the GPU host
@@ -63,6 +64,12 @@ async function agent() {
   await agent.init();
   const server = createAgentServer(agent, token);
   server.listen(Number(url.port), host, () => log(`listening on ${config.listen}, ${agent.holder ?? "no service"} holds the card`));
+  const proxies = config.services.flatMap((s) => {
+    if (s.proxy === undefined) return [];
+    const proxy = createProxy(agent, s);
+    proxy.server.listen(s.proxy, host, () => log(`proxy for ${s.name} on ${host}:${s.proxy}`));
+    return [proxy];
+  });
   // The next tick waits for this one, so a slow switch never queues ticks up.
   let timer: NodeJS.Timeout | undefined;
   const tick = () => {
@@ -78,8 +85,9 @@ async function agent() {
   const stop = async () => {
     clearTimeout(timer);
     // Let proxied responses finish before command services stop, up to 10s.
-    await Promise.race([new Promise((resolve) => server.close(resolve)), sleep(10_000)]);
-    server.closeAllConnections();
+    const closed = [new Promise((resolve) => server.close(resolve)), ...proxies.map((p) => p.close())];
+    await Promise.race([Promise.all(closed), sleep(10_000)]);
+    for (const s of [server, ...proxies.map((p) => p.server)]) s.closeAllConnections();
     await agent.shutdown();
     process.exit(0);
   };

@@ -60,7 +60,7 @@ A service runs as a systemd `unit`, a docker `container`, a `cmd` the agent runs
 
 **What blocks a stop.** A proxied request in flight, a kernel running a cell, a notebook open in a browser tab, a queued ComfyUI prompt, a running A1111 render, GPU utilization over `gpu_guard`, or a probe that got no answer. `--force` or the bot's Force button overrides it.
 
-**Proxy.** `/v1/*` routes by the request's `model`. `/v1/models` answers from config and wakes nothing.
+**Proxy.** Give a service `proxy: <port>` and point its clients there instead of at the service. Real work (a generation, a prompt, opening the web UI) wakes it; the plugin decides what counts. Health checks and status polls never wake anything: they get a 503 while the service is off, or its last answer for things like `/v1/models`. WebSockets pass through while it runs and close when it stops. The agent's own `/v1/*` routes by the request's `model` across all services with `models`.
 
 **Startup.** The agent adopts the service whose processes are running. If what runs matches no single service, it refuses to start rather than guess.
 
