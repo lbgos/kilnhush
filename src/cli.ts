@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Entry point: `kilnhush agent|bot|pair|status|start|stop|reload|fake`.
+// Entry point: `kilnhush setup|agent|bot|pair|status|start|stop|reload|fake`.
 import { isIP } from "node:net";
 import { hostname } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -17,8 +17,10 @@ import { plugins, probeService } from "./plugins/index.ts";
 import { portFree, proxyPool } from "./proxy.ts";
 import { createRunner, hostHas } from "./runners.ts";
 import { ConfigStore, type SettingsDeps, reload } from "./settings.ts";
+import { paths, readEnvFile, setup } from "./setup.ts";
 
-const usage = `kilnhush agent  --config kilnhush.yaml     run on the GPU host, with the bot if KILNHUSH_TG_TOKEN is set
+const usage = `kilnhush setup [--reconfigure] [--gpu N]  find GPU services, install and start the agent (sudo)
+kilnhush agent  --config kilnhush.yaml     run on the GPU host, with the bot if KILNHUSH_TG_TOKEN is set
 kilnhush bot                              run the bot elsewhere, against KILNHUSH_AGENT
 kilnhush pair                             print a link that adds you to the bot
 kilnhush status                           print the agent's state
@@ -27,7 +29,8 @@ kilnhush stop <service> [--force]         stop the service holding the card
 kilnhush reload                           apply a hand-edited config file
 kilnhush fake llama|jupyter --port N      stand-ins for the demo
 
-env: KILNHUSH_TOKEN      agent API token (required when the agent listens beyond loopback)
+env: KILNHUSH_TOKEN      agent API token (required when the agent listens beyond loopback;
+                         read from ${paths.env} when unset and readable)
      KILNHUSH_AGENT      agent URL for bot/status/start/stop, default http://127.0.0.1:7340
      KILNHUSH_TG_TOKEN   Telegram bot token`;
 
@@ -38,6 +41,8 @@ const { values: opts, positionals } = parseArgs({
   options: {
     config: { type: "string", default: "kilnhush.yaml" },
     force: { type: "boolean", default: false },
+    reconfigure: { type: "boolean", default: false },
+    gpu: { type: "string", default: "0" },
     port: { type: "string" },
     "load-ms": { type: "string" },
     "reply-ms": { type: "string" },
@@ -45,7 +50,7 @@ const { values: opts, positionals } = parseArgs({
   },
 });
 
-const token = process.env.KILNHUSH_TOKEN || undefined;
+const token = process.env.KILNHUSH_TOKEN || readEnvFile(paths.env).KILNHUSH_TOKEN || undefined;
 const client = () => agentClient(overHttp(process.env.KILNHUSH_AGENT ?? "http://127.0.0.1:7340", token));
 const tgToken = process.env.KILNHUSH_TG_TOKEN || undefined;
 const [command, arg] = positionals;
@@ -139,6 +144,11 @@ async function bot() {
 async function main() {
   if (opts.help || !command) return console.log(usage);
   switch (command) {
+    case "setup": {
+      const gpu = Number(opts.gpu);
+      if (!Number.isInteger(gpu) || gpu < 0) throw new Error(`--gpu takes an nvidia-smi index like 0, got ${opts.gpu}`);
+      return setup({ reconfigure: opts.reconfigure, gpu });
+    }
     case "agent":
       return agent();
     case "bot":
