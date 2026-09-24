@@ -46,7 +46,7 @@ const runner = (spec: { key: string; name: string }): Runner => ({
   },
 });
 
-const agent = new Agent(config, { runner, probe: probeService, gpu: async () => null, now: Date.now, sleep, log: () => {} });
+const agent = new Agent(config, { runner, probe: probeService, gpu: async () => null, gpuProcesses: async () => [], host: "gpu-host", now: Date.now, sleep, log: () => {} });
 await agent.init();
 const proxies = proxyPool(agent, "127.0.0.1", () => {});
 await Promise.all(proxies.servers().map((s) => once(s, "listening")));

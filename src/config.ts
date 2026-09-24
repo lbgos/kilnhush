@@ -124,7 +124,9 @@ export function checkConfig(input: unknown) {
       if ([g.unit, g.container, g.cmd].filter((k) => k !== undefined).length !== 1) {
         bad(`group entry ${i} needs exactly one of unit, container or cmd`);
       }
-      const key = g.unit ? `unit:${g.unit}` : g.container ? `container:${g.container}` : `cmd:${(g.cmd ?? []).join(" ")}`;
+      // systemd reads a unit name without a suffix as a .service, and so does the key.
+      const unit = g.unit && (g.unit.endsWith(".service") ? g.unit : `${g.unit}.service`);
+      const key = unit ? `unit:${unit}` : g.container ? `container:${g.container}` : `cmd:${(g.cmd ?? []).join(" ")}`;
       return {
         key,
         name: g.unit ?? g.container ?? g.cmd?.[0] ?? "?",
@@ -199,6 +201,7 @@ export function checkConfig(input: unknown) {
 
   return {
     listen,
+    port: listenPort,
     tick: raw.tick ?? 10_000,
     gpu: raw.gpu ?? 0,
     users: raw.telegram?.users ?? [],
@@ -219,7 +222,12 @@ function resolveHealth(value: string | undefined, base: URL | null, bad: (msg: s
     return undefined;
   }
   if (value === "tcp") return `tcp://${base.hostname}:${base.port || (base.protocol === "https:" ? 443 : 80)}`;
-  if (value.startsWith("/")) return new URL(value, base).href;
+  if (value.startsWith("/")) {
+    // A path under url: http://h/api with /ready is http://h/api/ready.
+    const url = new URL(base);
+    url.pathname = url.pathname.replace(/\/$/, "") + value;
+    return url.href;
+  }
   bad(`health ${value} is not a path, "tcp" or a URL`);
   return undefined;
 }

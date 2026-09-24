@@ -4,7 +4,7 @@ Switch one GPU between services that don't fit in VRAM together, without killing
 
 - An LLM wakes on its first `/v1/*` request and gives the card back when idle.
 - Jupyter only stops by hand, and not while a cell runs or a notebook is open.
-- A Telegram bot shows what holds the card and starts or stops services.
+- A Telegram bot shows what holds the card, starts or stops services, and changes every setting.
 
 ```text
 $ kilnhush stop jupyter
@@ -29,6 +29,19 @@ curl -s -X POST 'localhost:18888/demo?busy=1&tabs=1'
 node dist/cli.js stop jupyter                        # refused
 node dist/cli.js stop jupyter --force                # voice comes back
 ```
+
+## Bot
+
+Create a bot with @BotFather, give the agent its token as `KILNHUSH_TG_TOKEN`, and restart the agent. Then, on the GPU host:
+
+```text
+$ kilnhush pair
+open https://t.me/your_bot?start=k3m9q2xa within 10 minutes
+```
+
+The link adds your Telegram account to `telegram.users` in the config. A code works once. Anyone else who writes to the bot only gets told to run `kilnhush pair`.
+
+⚙ Settings covers the priority order, how each service runs (when used, always on, by hand), idle time, reminders, how long requests wait, removing services and users, and adding units and containers found on the host. An added HTTP service gets a proxy on its port + 10000, or the next free port; the bot says where to point its clients.
 
 ## Config
 
@@ -68,14 +81,13 @@ A service runs as a systemd `unit`, a docker `container`, a `cmd` the agent runs
 
 **Limits.** A notebook opened with no kernel has no session, so Jupyter can't report it. Set JupyterLab's `autosaveInterval` low. `cmd` services stop with the agent, so run long work as a systemd unit. Run the agent under a supervisor that kills its whole cgroup if it crashes, like the example unit's `KillMode=control-group`.
 
-**Run.** The agent runs as root on the GPU host. The bot runs anywhere that reaches it. Unit files are in [`examples/`](examples).
+**Run.** The agent runs as root on the GPU host, with the bot inside it when `KILNHUSH_TG_TOKEN` is set. To run the bot on another machine, use `kilnhush bot` there and leave the Telegram token out of the agent's env: Telegram allows one poller per token. Unit files are in [`examples/`](examples).
 
 | Env | Meaning |
 |---|---|
 | `KILNHUSH_TOKEN` | bearer token for `/api/*`, required unless the agent listens on loopback |
-| `KILNHUSH_AGENT` | agent URL for bot and CLI, default `http://127.0.0.1:7340` |
-| `KILNHUSH_TG_TOKEN` | Telegram bot token |
-| `KILNHUSH_TG_USERS` | comma-separated Telegram user ids allowed to use the bot |
+| `KILNHUSH_AGENT` | agent URL for `kilnhush bot` and the CLI, default `http://127.0.0.1:7340` |
+| `KILNHUSH_TG_TOKEN` | Telegram bot token, for the agent or `kilnhush bot` |
 
 `/v1/*` has no auth, same as llama-server. Keep it on your LAN.
 

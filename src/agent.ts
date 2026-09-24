@@ -3,8 +3,10 @@
 // and carry the answer out here, one at a time. Taking the card from a
 // service asks its probes first and refuses while that would lose work,
 // unless forced.
+import { basename } from "node:path";
 import type { AgentEvent, State } from "./api.ts";
 import type { Config, ServiceSpec } from "./config.ts";
+import { type GpuProcess, SELF } from "./discover.ts";
 import { type Snapshot, planRequest, planTick } from "./plan.ts";
 import { type Activity, type Gpu, mergeActivity } from "./probe.ts";
 import { type Runner, type RunnerSpec, waitHealthy } from "./runners.ts";
@@ -33,6 +35,9 @@ export type AgentDeps = {
   /** The plugin's busy probe, or null for services without one. */
   probe: (service: ServiceSpec) => Promise<Activity | null>;
   gpu: () => Promise<Gpu | null>;
+  /** Compute processes on the managed GPU. Empty where nvidia-smi is missing. */
+  gpuProcesses: () => Promise<GpuProcess[]>;
+  host: string;
   now: () => number;
   sleep: (ms: number) => Promise<unknown>;
   log: (msg: string) => void;
@@ -40,6 +45,25 @@ export type AgentDeps = {
 
 /** What must not change under a running service. */
 const runShape = (s: ServiceSpec) => JSON.stringify([s.plugin.id, s.url, s.health, s.procs]);
+
+/**
+ * Splits GPU processes into the holder's memory use and the processes no
+ * service owns. Processes in the agent's own unit are the holder's commands.
+ */
+export function gpuUse(procs: GpuProcess[], services: ServiceSpec[], holder: string | null) {
+  const owners = new Map(services.flatMap((s) => s.procs.map((p) => [p.key, s.name] as const)));
+  let vram: number | null = null;
+  const unmanaged: State["unmanaged"] = [];
+  for (const p of procs) {
+    const key = p.owner && `${p.owner.kind}:${p.owner.name}`;
+    const owner = key === `unit:${SELF}` ? holder : key && owners.get(key);
+    if (owner && owner === holder) vram = (vram ?? 0) + p.usedMiB;
+    if (owner) continue;
+    const command = basename(p.cmdline.split(" ")[0] ?? "") || "?";
+    unmanaged.push({ pid: p.pid, name: p.owner?.name ?? command, usedMiB: p.usedMiB });
+  }
+  return { vram, unmanaged };
+}
 
 /** Runs async sections one at a time, in call order. */
 class Lock {
@@ -255,6 +279,7 @@ export class Agent {
     const act = holder ? await this.#activity(holder) : null;
     const remind = holder ? this.service(holder).remind : 0;
     const lastActive = act?.lastActive ?? this.#since;
+    const procs = await this.deps.gpuProcesses().catch(() => []);
     return {
       holder,
       switching: this.#switching,
@@ -276,6 +301,8 @@ export class Agent {
       })),
       warnings: this.#config.warnings,
       gpu: await this.deps.gpu(),
+      host: this.deps.host,
+      ...gpuUse(procs, this.#config.services, holder),
       events: this.#events.slice(-20).reverse(),
     };
   }

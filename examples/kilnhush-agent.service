@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 ExecStart=/usr/bin/node /opt/kilnhush/dist/cli.js agent --config /etc/kilnhush/kilnhush.yaml
-# KILNHUSH_TOKEN=..., JUPYTER_TOKEN=...
+# KILNHUSH_TOKEN=..., JUPYTER_TOKEN=..., KILNHUSH_TG_TOKEN=... to run the bot here
 EnvironmentFile=/etc/kilnhush/env
 Restart=on-failure
 # If the agent dies without cleaning up, systemd kills its whole cgroup,
