@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { containerRunning, unitRunning } from "../src/services.ts";
+import { containerRunning, unitRunning } from "../src/runners.ts";
 
 test("unit states: starting and stopping units still count as running, unknown output throws", () => {
   assert.equal(unitRunning("active"), true);
