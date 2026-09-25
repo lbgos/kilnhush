@@ -20,9 +20,10 @@ export const runLabel: Record<Run, string> = {
 };
 
 const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
+const gb = (mib: number) => (mib / 1024).toFixed(1);
 
 function headline(s: State, now: number) {
-  if (s.holder) return `${s.holder} · ${formatDuration(now - s.since)}`;
+  if (s.holder) return `${s.holder} · ${formatDuration(now - s.since)}${s.vram === null ? "" : ` · ${gb(s.vram)} GB`}`;
   if (s.switching) return `starting ${s.switching}…`;
   if (s.risks.length > 0) return "no service, the last switch failed";
   return s.homePaused ? "card free, home stopped by hand" : "card free";
@@ -34,8 +35,10 @@ export function formatState(s: State, now = Date.now()) {
   if (s.gpu) {
     const { name, util, memUsed, memTotal } = s.gpu;
     const filled = Math.round((memUsed / Math.max(memTotal, 1)) * 16);
-    const gb = (mib: number) => (mib / 1024).toFixed(1);
-    lines.push(`${name} ${util}%`, `${"█".repeat(filled)}${"░".repeat(16 - filled)} ${gb(memUsed)}/${gb(memTotal)} GB`);
+    lines.push(`${s.host} · ${name} ${util}%`, `${"█".repeat(filled)}${"░".repeat(16 - filled)} ${gb(memUsed)}/${gb(memTotal)} GB`);
+  }
+  if (s.unmanaged.length > 0) {
+    lines.push(`also on the GPU: ${s.unmanaged.map((p) => `${p.name} (pid ${p.pid}) ${gb(p.usedMiB)} GB`).join(", ")}`);
   }
   for (const risk of s.risks) lines.push(`! ${risk}`);
   lines.push("");

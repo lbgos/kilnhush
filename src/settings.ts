@@ -8,7 +8,8 @@ import { type } from "arktype";
 import { stringify } from "yaml";
 import type { Agent } from "./agent.ts";
 import { type Config, type ConfigSource, checkConfig, parseConfig } from "./config.ts";
-import type { Discovery } from "./discover.ts";
+import type { Discovery, Found } from "./discover.ts";
+import type { Pairing } from "./pairing.ts";
 import { plugins } from "./plugins/index.ts";
 import type { Run } from "./plugins/types.ts";
 
@@ -148,6 +149,20 @@ export function updateService(source: ConfigSource, current: Config, name: strin
   if (patch.wait !== undefined) service.wait = patch.wait;
 }
 
+/** Lets Telegram user `id` use the bot. */
+export function addUser(source: ConfigSource, id: number) {
+  const users = source.telegram?.users ?? [];
+  source.telegram = { ...source.telegram, users: users.includes(id) ? users : [...users, id] };
+}
+
+/** Takes Telegram user `id` off the bot. The last user stays, so the bot never locks everyone out. */
+export function removeUser(source: ConfigSource, id: number) {
+  const users = source.telegram?.users ?? [];
+  if (!users.includes(id)) throw new RangeError(`unknown user ${id}`);
+  if (new Set(users).size === 1) throw new Error("the last user can't be removed");
+  source.telegram = { ...source.telegram, users: users.filter((u) => u !== id) };
+}
+
 function indexOf(source: ConfigSource, name: string) {
   const i = source.services.findIndex((s) => s.name === name);
   if (i === -1) throw new RangeError(`unknown service ${name}`);
@@ -172,6 +187,10 @@ export function settingsView(config: Config) {
     })),
     plugins: [...plugins.values()].map((p) => ({ id: p.id, name: p.name, port: p.port, run: p.run })),
     warnings: config.warnings,
+    /** Telegram user ids allowed to use the bot. */
+    users: config.users,
+    /** The agent's own port. */
+    port: config.port,
   };
 }
 
@@ -198,6 +217,8 @@ const updateBody = type({
 });
 const moveBody = type({ "+": "reject", name: "string", to: "number.integer >= 0" });
 const nameBody = type({ "+": "reject", name: "string" });
+const userBody = type({ "+": "reject", user: "number.integer" });
+const redeemBody = type({ "+": "reject", code: "string", user: "number.integer" });
 
 export type SettingsDeps = {
   store: ConfigStore;
@@ -206,6 +227,7 @@ export type SettingsDeps = {
   discover: () => Promise<Discovery>;
   /** Whether a proxy could listen on the port now. */
   portFree: (port: number) => Promise<boolean>;
+  pairing: Pairing;
 };
 
 /**
@@ -233,8 +255,14 @@ export async function settingsRoute(agent: Agent, deps: SettingsDeps, action: st
         const input = parse(addBody);
         if (!input.unit === !input.container) return bad("give exactly one of unit or container");
         if (!(await deps.hostHas(input))) return bad(`this host has no ${input.unit ?? input.container}`);
-        if (input.proxy !== undefined && !(await deps.portFree(input.proxy))) return bad(`port ${input.proxy} is in use`);
-        return ok(await edit(agent, deps.store, (source, current) => addService(source, current, input)));
+        // A proxy port something else listens on moves to the next free one; the view shows which.
+        const taken = reservedPorts(agent.config.port, [...agent.config.services, { url: input.url }]);
+        let { proxy } = input;
+        for (let tries = 0; proxy !== undefined && (taken.has(proxy) || !(await deps.portFree(proxy))); tries++) {
+          if (tries === 20 || proxy === 65_535) return bad(`no free proxy port from ${input.proxy}`);
+          proxy++;
+        }
+        return ok(await edit(agent, deps.store, (source, current) => addService(source, current, { ...input, proxy })));
       }
       case "update": {
         const { name, ...patch } = parse(updateBody);
@@ -248,10 +276,74 @@ export async function settingsRoute(agent: Agent, deps: SettingsDeps, action: st
         const input = parse(nameBody);
         return ok(await edit(agent, deps.store, (source) => removeService(source, input.name)));
       }
+      case "redeem": {
+        const input = parse(redeemBody);
+        // The code is used up only once the user is saved, so a refused edit can be retried.
+        if (!deps.pairing.valid(input.code)) return bad("unknown or expired code");
+        const next = await edit(agent, deps.store, (source) => addUser(source, input.user));
+        deps.pairing.redeem(input.code);
+        return ok(next);
+      }
+      case "remove-user": {
+        const input = parse(userBody);
+        return ok(await edit(agent, deps.store, (source) => removeUser(source, input.user)));
+      }
       default:
         return { status: 404, body: { error: "not found" } };
     }
   } catch (err) {
     return bad((err as Error).message);
   }
+}
+
+/**
+ * A service name from a unit or container name: no `.service`, lowercase,
+ * other characters as `-`, at most 32 characters, `-2`, `-3`… when taken.
+ */
+export function serviceName(raw: string, taken: ReadonlySet<string>) {
+  const base =
+    raw
+      .replace(/\.service$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "-")
+      .replace(/^[_-]+/, "")
+      .slice(0, 32) || "service";
+  let name = base;
+  for (let i = 2; taken.has(name); i++) name = `${base.slice(0, 32 - `-${i}`.length)}-${i}`;
+  return name;
+}
+
+/**
+ * The /api/settings/add body for a discovered unit or container. The URL uses
+ * the plugin's port when the service listens there (or nothing was seen), else
+ * its first listening port. The proxy goes on that port + 10000, or the next
+ * port no other proxy and not the agent uses. Raw TCP services (Wyoming, whose
+ * health check is "tcp") get no proxy: it only carries HTTP and WebSockets.
+ * `busy`: ports something else listens on, also skipped.
+ */
+export function proposeService(
+  found: Found,
+  view: { port: number; services: readonly { name: string; url?: string | null; proxy?: number | null }[] },
+  busy: ReadonlySet<number> = new Set(),
+) {
+  const plugin = plugins.get(found.plugin ?? "custom");
+  const { ports } = found;
+  const port = plugin && plugin.port > 0 && (ports.length === 0 || ports.includes(plugin.port)) ? plugin.port : ports[0];
+  const taken = new Set([...reservedPorts(view.port, view.services), ...busy]);
+  // Ports past 65535 wrap around into 1024 and up.
+  const next = (p: number) => ((p - 1_024) % (65_536 - 1_024)) + 1_024;
+  let proxy = port === undefined || plugin?.health === "tcp" ? undefined : next(port + 10_000);
+  while (proxy !== undefined && taken.has(proxy)) proxy = next(proxy + 1);
+  return {
+    name: serviceName(found.owner.name, new Set(view.services.map((s) => s.name))),
+    plugin: plugin?.id ?? "custom",
+    ...(found.owner.kind === "unit" ? { unit: found.owner.name } : { container: found.owner.name }),
+    ...(port !== undefined && { url: `http://127.0.0.1:${port}` }),
+    ...(proxy !== undefined && { proxy }),
+  };
+}
+
+/** Ports a new proxy must not take: the agent's, every proxy's and every service's own. */
+function reservedPorts(agentPort: number, services: readonly { url?: string | null; proxy?: number | null }[]) {
+  return new Set([agentPort, ...services.flatMap((s) => [s.proxy ?? 0, Number(URL.parse(s.url ?? "")?.port || 0)])]);
 }

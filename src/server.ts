@@ -10,9 +10,43 @@ import { type SettingsDeps, settingsRoute } from "./settings.ts";
 const actionBody = type({ service: "string", "force?": "boolean" });
 const maxBody = 64 * 1024 * 1024;
 
-/** Without `settings`, the /api/settings routes answer 404. */
+/**
+ * The /api routes without HTTP: auth and body parsing are the caller's. The
+ * server uses it, and so does an in-process bot, through agentClient().
+ * Without `settings`, the settings and pairing routes answer 404.
+ */
+export function apiRoutes(agent: Agent, settings?: SettingsDeps) {
+  return async (method: string, path: string, body: unknown): Promise<{ status: number; body: unknown }> => {
+    if (path === "/api/state" && method === "GET") return { status: 200, body: await agent.state() };
+    if (settings && path === "/api/pair" && method === "POST") return { status: 200, body: settings.pairing.create() };
+    if (settings && path.startsWith("/api/settings/")) {
+      const action = path.slice("/api/settings/".length);
+      const read = action === "view" || action === "discover";
+      if (method !== (read ? "GET" : "POST")) return { status: 405, body: { error: "method not allowed" } };
+      return settingsRoute(agent, settings, action, body);
+    }
+    if ((path === "/api/start" || path === "/api/stop") && method === "POST") {
+      const input = actionBody(body);
+      if (input instanceof type.errors) return { status: 400, body: { error: input.summary } };
+      if (!agent.config.services.some((s) => s.name === input.service)) {
+        return { status: 400, body: { error: `unknown service ${input.service}` } };
+      }
+      try {
+        if (path === "/api/start") await agent.start(input.service, input.force ?? false);
+        else await agent.stop(input.service, input.force ?? false);
+      } catch (err) {
+        if (err instanceof BusyError) return { status: 409, body: { error: err.message, service: err.service, risks: err.risks } };
+        return { status: 500, body: { error: (err as Error).message } };
+      }
+      return { status: 200, body: await agent.state() };
+    }
+    return { status: 404, body: { error: "not found" } };
+  };
+}
+
 export function createAgentServer(agent: Agent, token?: string, settings?: SettingsDeps) {
   const modelServices = () => agent.config.services.filter((s) => s.models.length > 0);
+  const api = apiRoutes(agent, settings);
 
   const authorized = (req: IncomingMessage) => {
     if (!token) return true;
@@ -57,44 +91,16 @@ export function createAgentServer(agent: Agent, token?: string, settings?: Setti
 
     if (path.startsWith("/api/")) {
       if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
-      if (path === "/api/state" && req.method === "GET") return json(res, 200, await agent.state());
-      if (settings && path.startsWith("/api/settings/")) {
-        const action = path.slice("/api/settings/".length);
-        const read = action === "view" || action === "discover";
-        if (req.method !== (read ? "GET" : "POST")) return json(res, 405, { error: "method not allowed" });
-        let body: unknown = {};
-        if (!read) {
-          try {
-            body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
-          } catch {
-            return json(res, 400, { error: "body is not JSON" });
-          }
-        }
-        const result = await settingsRoute(agent, settings, action, body);
-        return json(res, result.status, result.body);
-      }
-      if ((path === "/api/start" || path === "/api/stop") && req.method === "POST") {
-        let parsed: unknown;
+      let body: unknown = {};
+      if (req.method === "POST") {
         try {
-          parsed = JSON.parse((await readBody(req)).toString("utf8"));
+          body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
         } catch {
           return json(res, 400, { error: "body is not JSON" });
         }
-        const input = actionBody(parsed);
-        if (input instanceof type.errors) return json(res, 400, { error: input.summary });
-        if (!agent.config.services.some((s) => s.name === input.service)) {
-          return json(res, 400, { error: `unknown service ${input.service}` });
-        }
-        try {
-          if (path === "/api/start") await agent.start(input.service, input.force ?? false);
-          else await agent.stop(input.service, input.force ?? false);
-        } catch (err) {
-          if (err instanceof BusyError) return json(res, 409, { error: err.message, service: err.service, risks: err.risks });
-          return json(res, 500, { error: (err as Error).message });
-        }
-        return json(res, 200, await agent.state());
       }
-      return json(res, 404, { error: "not found" });
+      const reply = await api(req.method ?? "GET", path, body);
+      return json(res, reply.status, reply.body);
     }
 
     // Model lists come from config, so listing does not wake anything.

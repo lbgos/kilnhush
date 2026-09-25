@@ -24,6 +24,7 @@ test("defaults come from the plugin and the url", () => {
   assert.equal(s?.idle, 20 * 60_000);
   assert.deepEqual(s?.procs.map((p) => p.key), ["unit:web.service"]);
   assert.equal(one(`{ name: t, unit: t, url: "http://h:7", health: tcp }`).services[0]?.health, "tcp://h:7");
+  assert.equal(one(`{ name: t, unit: t, url: "http://h:7/api/", health: /ready }`).services[0]?.health, "http://h:7/api/ready");
 });
 
 test("a group keeps each process's own health check", () => {
