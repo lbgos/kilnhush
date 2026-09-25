@@ -1,0 +1,29 @@
+# A pushed tag vX.Y.Z builds the package and attaches it to a GitHub release
+# as kilnhush.tgz, the file install.sh downloads.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The release step gets its token as GH_TOKEN; install scripts never see it.
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Tag matches package.json
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - run: pnpm check
+      - run: mv "$(npm pack --silent)" kilnhush.tgz
+      - run: gh release create "$GITHUB_REF_NAME" kilnhush.tgz --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
