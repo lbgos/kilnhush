@@ -1,30 +1,25 @@
-# RTX 3080, 10 GB. Voice for Home Assistant by default, Bonsai 27B on demand,
-# JupyterLab by hand. Runs as root, next to the units it controls.
+# RTX 3080, 10 GB. JupyterLab by hand, Bonsai 27B on demand, voice for Home
+# Assistant the rest of the time. Runs as root, next to the units it controls.
 listen: 0.0.0.0:7340
-default: voice
-modes:
-  voice:
-    services:
+services:
+  - name: jupyter
+    plugin: jupyter
+    remind: 3h
+    gpu_guard: 20
+    token_env: JUPYTER_TOKEN
+    unit: jupyter-3080.service
+  - name: bonsai
+    plugin: llamacpp
+    idle: 20m
+    ready_timeout: 3m
+    models: [bonsai]
+    unit: bonsai-3080.service
+  - name: voice
+    plugin: wyoming
+    group:
       - unit: wyoming-faster-whisper.service
         health: tcp://127.0.0.1:10300
       - unit: wyoming-kokoro.service
         health: tcp://127.0.0.1:10800
       - unit: qwen35-3080.service
         health: http://127.0.0.1:8080/health
-  bonsai:
-    idle: 20m
-    proxy:
-      target: http://127.0.0.1:8080
-    services:
-      - unit: bonsai-3080.service
-        health: http://127.0.0.1:8080/health
-        ready_timeout: 3m
-  jupyter:
-    remind: 3h
-    gpu_guard: 20
-    jupyter:
-      url: http://127.0.0.1:8888
-      token_env: JUPYTER_TOKEN
-    services:
-      - unit: jupyter-3080.service
-        health: http://127.0.0.1:8888/api

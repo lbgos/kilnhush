@@ -1,0 +1,5 @@
+# Review stacked PRs too, not only PRs into main.
+reviews:
+  auto_review:
+    enabled: true
+    base_branches: [".*"]
