@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
-import { parseSmi, probeJupyter } from "../src/probe.ts";
+import { probeKernels } from "../src/plugins/jupyter.ts";
+import { parseSmi } from "../src/probe.ts";
 
 async function jupyter(routes: Record<string, unknown>) {
   const server: Server = createServer((req, res) => {
@@ -26,7 +27,7 @@ test("a busy kernel without a session still blocks", async () => {
     "/api/kernels": [kernel("aaaaaaaa-1", "idle", 1), kernel("bbbbbbbb-2", "busy")],
     "/api/sessions": [{ path: "train.ipynb", kernel: { id: "aaaaaaaa-1" } }],
   });
-  const act = await probeJupyter({ url, tokenEnv: undefined });
+  const act = await probeKernels({ url });
   server.close();
   assert.equal(act.busy, true);
   assert.deepEqual(act.risks, [
@@ -37,7 +38,7 @@ test("a busy kernel without a session still blocks", async () => {
 
 test("either endpoint failing is a risk, not idle", async () => {
   const { server, url } = await jupyter({ "/api/kernels": [] });
-  const act = await probeJupyter({ url, tokenEnv: undefined });
+  const act = await probeKernels({ url });
   server.close();
   assert.equal(act.busy, false);
   assert.match(act.risks[0] ?? "", /api\/sessions answered 500/);
@@ -45,7 +46,7 @@ test("either endpoint failing is a risk, not idle", async () => {
 
 test("unexpected JSON is a risk, not a crash", async () => {
   const { server, url } = await jupyter({ "/api/kernels": [{ id: 7 }], "/api/sessions": [] });
-  const act = await probeJupyter({ url, tokenEnv: undefined });
+  const act = await probeKernels({ url });
   server.close();
   assert.match(act.risks[0] ?? "", /api\/kernels sent unexpected JSON/);
 });

@@ -1,5 +1,6 @@
-// Stand-ins for llama-server and Jupyter, so the demo and tests run on any
-// machine without a GPU.
+// Stand-ins for llama-server, Jupyter and ComfyUI, so the demo and tests run
+// on any machine without a GPU.
+import { createHash } from "node:crypto";
 import { type Server, createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -7,14 +8,17 @@ const listen = (server: Server, port: number) =>
   new Promise<Server>((resolve) => server.listen(port, "127.0.0.1", () => resolve(server)));
 
 /**
- * Answers /health and /v1/chat/completions after `loadMs` of fake model
- * loading. Replies take `replyMs`; `stream: true` sends SSE chunks.
+ * Answers /health, /v1/models and /v1/chat/completions after `loadMs` of
+ * fake model loading. Replies take `replyMs`; `stream: true` sends SSE chunks.
  */
 export async function fakeLlama(port: number, { loadMs = 0, replyMs = 500 } = {}) {
   await sleep(loadMs);
   const words = "hello from a fake llama-server".split(" ");
   const server = createServer(async (req, res) => {
     if (req.url === "/health") return res.writeHead(200).end('{"status":"ok"}');
+    if (req.url?.startsWith("/v1/models")) {
+      return res.writeHead(200, { "content-type": "application/json" }).end('{"object":"list","data":[{"id":"bonsai"}]}');
+    }
     if (req.url !== "/v1/chat/completions" || req.method !== "POST") return res.writeHead(404).end();
     let raw = "";
     for await (const chunk of req) raw += String(chunk);
@@ -56,6 +60,34 @@ export function fakeJupyter(port: number) {
       return json(kernel);
     }
     res.writeHead(404).end();
+  });
+  return listen(server, port);
+}
+
+/**
+ * Serves the page (sent in two parts, 200 ms apart), /system_stats, an empty
+ * /queue, and WS /ws, which sends one status message and stays open.
+ */
+export function fakeComfy(port: number) {
+  const server = createServer(async (req, res) => {
+    const json = (body: unknown) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+    if (req.url === "/system_stats") return json({ system: { os: "fake" } });
+    if (req.url === "/queue") return json({ queue_running: [], queue_pending: [] });
+    if (req.url !== "/") return res.writeHead(404).end();
+    res.writeHead(200, { "content-type": "text/html" }).write("<!doctype html><title>ComfyUI</title>");
+    await sleep(200);
+    res.end("<p>fake</p>");
+  });
+  server.on("upgrade", (req, socket) => {
+    socket.on("error", () => {});
+    socket.resume();
+    const key = req.headers["sec-websocket-key"];
+    if (req.url !== "/ws" || !key) return socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+    const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: ${accept}\r\n\r\n`);
+    const status = Buffer.from(JSON.stringify({ type: "status", data: { status: { exec_info: { queue_remaining: 0 } } } }));
+    // One unmasked text frame; the message is under 126 bytes.
+    socket.write(Buffer.concat([Buffer.from([0x81, status.length]), status]));
   });
   return listen(server, port);
 }

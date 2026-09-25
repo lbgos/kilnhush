@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { Plugin } from "./plugins/types.ts";
-import { containerRunning, unitRunning } from "./services.ts";
+import { containerRunning, unitRunning } from "./runners.ts";
 
 export type Owner = { kind: "unit" | "container"; name: string };
 export type GpuProcess = { pid: number; usedMiB: number; owner: Owner | null; cmdline: string };
@@ -33,7 +33,7 @@ export const hostDeps: Deps = {
 };
 
 /** The agent's own unit. GPU processes in it are services it runs from `cmd`. */
-const SELF = "kilnhush.service";
+export const SELF = "kilnhush.service";
 
 /** GPU compute processes on one GPU with the unit or container that owns each. */
 export async function gpuProcesses(gpu: number, deps: Deps = hostDeps): Promise<GpuProcess[]> {
@@ -193,7 +193,8 @@ function parseListeners(rows: string[]) {
     const local = row.split(/\s+/)[3] ?? "";
     const port = Number(local.slice(local.lastIndexOf(":") + 1));
     if (!port) return [];
-    return [...row.matchAll(/pid=(\d+)/g)].map((m) => ({ pid: Number(m[1]), port }));
+    // users:(("ollama",pid=4100,fd=3)); a process name can't fake the fields around the pid.
+    return [...row.matchAll(/",pid=(\d+),fd=/g)].map((m) => ({ pid: Number(m[1]), port }));
   });
 }
 
