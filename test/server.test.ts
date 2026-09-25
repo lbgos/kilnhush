@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { after, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agent } from "../src/agent.ts";
-import { agentClient } from "../src/api.ts";
+import { agentClient, overHttp } from "../src/api.ts";
 import { parseConfig } from "../src/config.ts";
 import { fakeJupyter, fakeLlama } from "../src/fake.ts";
 import { probeService } from "../src/plugins/index.ts";
@@ -43,6 +43,8 @@ const agent = new Agent(config, {
   runner,
   probe: probeService,
   gpu: async () => null,
+  gpuProcesses: async () => [],
+  host: "gpu-host",
   now: Date.now,
   sleep,
   log: () => {},
@@ -51,7 +53,7 @@ await agent.init();
 const server = createAgentServer(agent, "secret").listen(0, "127.0.0.1");
 await new Promise((resolve) => server.once("listening", resolve));
 const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-const client = agentClient(base, "secret");
+const client = agentClient(overHttp(base, "secret"));
 
 after(() => {
   server.close();

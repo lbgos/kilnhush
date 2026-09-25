@@ -43,6 +43,8 @@ function setup({ running = [] as string[], failStart = "", failStop = [] as stri
     runner,
     probe: async (s) => structuredClone(probes.get(s.name) ?? null),
     gpu: async () => null,
+    gpuProcesses: async () => [],
+    host: "gpu-host",
     now: () => now,
     // Waiting requests poll once a second; let fake time pass instead.
     sleep: async (ms) => {
