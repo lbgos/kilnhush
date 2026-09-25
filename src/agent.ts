@@ -3,8 +3,10 @@
 // and carry the answer out here, one at a time. Taking the card from a
 // service asks its probes first and refuses while that would lose work,
 // unless forced.
+import { basename } from "node:path";
 import type { AgentEvent, State } from "./api.ts";
 import type { Config, ServiceSpec } from "./config.ts";
+import { type GpuProcess, SELF } from "./discover.ts";
 import { type Snapshot, planRequest, planTick } from "./plan.ts";
 import { type Activity, type Gpu, mergeActivity } from "./probe.ts";
 import { type Runner, type RunnerSpec, waitHealthy } from "./runners.ts";
@@ -33,10 +35,35 @@ export type AgentDeps = {
   /** The plugin's busy probe, or null for services without one. */
   probe: (service: ServiceSpec) => Promise<Activity | null>;
   gpu: () => Promise<Gpu | null>;
+  /** Compute processes on the managed GPU. Empty where nvidia-smi is missing. */
+  gpuProcesses: () => Promise<GpuProcess[]>;
+  host: string;
   now: () => number;
   sleep: (ms: number) => Promise<unknown>;
   log: (msg: string) => void;
 };
+
+/** What must not change under a running service. */
+const runShape = (s: ServiceSpec) => JSON.stringify([s.plugin.id, s.url, s.health, s.procs]);
+
+/**
+ * Splits GPU processes into the holder's memory use and the processes no
+ * service owns. Processes in the agent's own unit are the holder's commands.
+ */
+export function gpuUse(procs: GpuProcess[], services: ServiceSpec[], holder: string | null) {
+  const owners = new Map(services.flatMap((s) => s.procs.map((p) => [p.key, s.name] as const)));
+  let vram: number | null = null;
+  const unmanaged: State["unmanaged"] = [];
+  for (const p of procs) {
+    const key = p.owner && `${p.owner.kind}:${p.owner.name}`;
+    const owner = key === `unit:${SELF}` ? holder : key && owners.get(key);
+    if (owner && owner === holder) vram = (vram ?? 0) + p.usedMiB;
+    if (owner) continue;
+    const command = basename(p.cmdline.split(" ")[0] ?? "") || "?";
+    unmanaged.push({ pid: p.pid, name: p.owner?.name ?? command, usedMiB: p.usedMiB });
+  }
+  return { vram, unmanaged };
+}
 
 /** Runs async sections one at a time, in call order. */
 class Lock {
@@ -69,17 +96,17 @@ export class Agent {
   #events: AgentEvent[] = [];
   #lock = new Lock();
   #runners = new Map<string, Runner>();
+  /** The spec each runner was made from, as JSON. */
+  #runnerShapes = new Map<string, string>();
+  #stopListeners = new Set<(name: string) => void>();
+  #configListeners = new Set<(config: Config) => void>();
 
   constructor(
     config: Config,
     private deps: AgentDeps,
   ) {
     this.#config = config;
-    for (const service of config.services) {
-      for (const proc of service.procs) {
-        if (!this.#runners.has(proc.key)) this.#runners.set(proc.key, deps.runner({ ...proc, readyTimeout: service.readyTimeout }));
-      }
-    }
+    this.#syncRunners();
   }
 
   get config() {
@@ -224,11 +251,35 @@ export class Agent {
     }
   }
 
+  /**
+   * Whether `name` holds the card with no switch in progress, for requests
+   * that must not wake it. While the card is switching to `name`, answers
+   * once that switch is done, so requests right after a page load that woke
+   * the service get through. The switch is bounded by the runners' timeouts.
+   */
+  async running(name: string): Promise<boolean> {
+    if (this.#switching === name) await this.#lock.run(async () => {});
+    return this.#holder === name && !this.#gate;
+  }
+
+  /** Calls `fn` with a service's name each time its processes have stopped. Returns an unsubscribe. */
+  onStop(fn: (name: string) => void) {
+    this.#stopListeners.add(fn);
+    return () => void this.#stopListeners.delete(fn);
+  }
+
+  /** Calls `fn` after each config change is applied. Returns an unsubscribe. */
+  onConfig(fn: (config: Config) => void) {
+    this.#configListeners.add(fn);
+    return () => void this.#configListeners.delete(fn);
+  }
+
   async state(): Promise<State> {
     const holder = this.#holder;
     const act = holder ? await this.#activity(holder) : null;
     const remind = holder ? this.service(holder).remind : 0;
     const lastActive = act?.lastActive ?? this.#since;
+    const procs = await this.deps.gpuProcesses().catch(() => []);
     return {
       holder,
       switching: this.#switching,
@@ -250,8 +301,44 @@ export class Agent {
       })),
       warnings: this.#config.warnings,
       gpu: await this.deps.gpu(),
+      host: this.deps.host,
+      ...gpuUse(procs, this.#config.services, holder),
       events: this.#events.slice(-20).reverse(),
     };
+  }
+
+  /**
+   * Swaps in the config `build` returns. The holder must still exist and run
+   * the same way: removing it or changing its plugin, url or processes is
+   * refused until it stops. Other changes only affect later decisions; a new
+   * priority order never evicts anything by itself. `build` and `commit` run
+   * inside the lock, so edits apply in order, and a failed commit changes
+   * nothing.
+   */
+  reconfigure(build: () => Config | Promise<Config>, commit: (next: Config) => Promise<unknown> = async () => {}) {
+    return this.#lock.run(async () => {
+      // Leftovers of a failed start must stay known until a forced start clears them.
+      if (this.#stuck) throw new Error(this.#stuck);
+      const next = await build();
+      // The listener and the GPU reader are set up once, at startup.
+      if (next.listen !== this.#config.listen || next.gpu !== this.#config.gpu) {
+        throw new Error("listen and gpu change only with a restart of the agent");
+      }
+      const holder = this.#holder;
+      if (holder) {
+        const after = next.services.find((s) => s.name === holder);
+        if (!after) throw new Error(`stop ${holder} before removing it`);
+        if (runShape(after) !== runShape(this.service(holder))) throw new Error(`stop ${holder} before changing how it runs`);
+        // A new run setting starts its idle clock now, so on_demand does not stop it at once.
+        if (after.run !== this.service(holder).run) this.#lastRequest.set(holder, this.deps.now());
+      }
+      await commit(next);
+      if (next.home !== this.#config.home) this.#homePaused = false;
+      this.#config = next;
+      this.#syncRunners();
+      for (const fn of this.#configListeners) fn(next);
+      return next;
+    });
   }
 
   /**
@@ -276,6 +363,31 @@ export class Agent {
         [...this.#runners.values()].filter((r) => r.key.startsWith("cmd:")).map((r) => r.stop().catch(() => {})),
       );
     });
+  }
+
+  /**
+   * One runner per process key. A runner is replaced when its spec changed,
+   * except the holder's: those keep their running child, and reconfigure
+   * already refused changes to how the holder runs.
+   */
+  #syncRunners() {
+    const keys = new Set<string>();
+    const held = new Set(this.#holder ? this.service(this.#holder).procs.map((p) => p.key) : []);
+    for (const service of this.#config.services) {
+      for (const proc of service.procs) {
+        keys.add(proc.key);
+        const spec = { ...proc, readyTimeout: service.readyTimeout };
+        const shape = JSON.stringify(spec);
+        if (this.#runnerShapes.get(proc.key) === shape || (held.has(proc.key) && this.#runners.has(proc.key))) continue;
+        this.#runners.set(proc.key, this.deps.runner(spec));
+        this.#runnerShapes.set(proc.key, shape);
+      }
+    }
+    for (const key of this.#runners.keys()) {
+      if (keys.has(key)) continue;
+      this.#runners.delete(key);
+      this.#runnerShapes.delete(key);
+    }
   }
 
   #runnersOf(name: string) {
@@ -379,6 +491,7 @@ export class Agent {
       }
 
       this.#holder = null;
+      if (from !== null) for (const fn of this.#stopListeners) fn(from);
       if (target === null) {
         this.#event("stop", `${from}${forced}`);
         return;

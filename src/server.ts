@@ -1,16 +1,52 @@
 // HTTP front of the agent: the control API under /api and an OpenAI-compatible
 // proxy under /v1 that wakes the service serving the requested model.
 import { timingSafeEqual } from "node:crypto";
-import { type ClientRequest, type IncomingMessage, type ServerResponse, createServer, request } from "node:http";
-import { request as requestTls } from "node:https";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { type } from "arktype";
-import { type Agent, BusyError, RefusedError } from "./agent.ts";
+import { type Agent, BusyError } from "./agent.ts";
+import { forward, hold, json } from "./proxy.ts";
+import { type SettingsDeps, settingsRoute } from "./settings.ts";
 
 const actionBody = type({ service: "string", "force?": "boolean" });
 const maxBody = 64 * 1024 * 1024;
 
-export function createAgentServer(agent: Agent, token?: string) {
+/**
+ * The /api routes without HTTP: auth and body parsing are the caller's. The
+ * server uses it, and so does an in-process bot, through agentClient().
+ * Without `settings`, the settings and pairing routes answer 404.
+ */
+export function apiRoutes(agent: Agent, settings?: SettingsDeps) {
+  return async (method: string, path: string, body: unknown): Promise<{ status: number; body: unknown }> => {
+    if (path === "/api/state" && method === "GET") return { status: 200, body: await agent.state() };
+    if (settings && path === "/api/pair" && method === "POST") return { status: 200, body: settings.pairing.create() };
+    if (settings && path.startsWith("/api/settings/")) {
+      const action = path.slice("/api/settings/".length);
+      const read = action === "view" || action === "discover";
+      if (method !== (read ? "GET" : "POST")) return { status: 405, body: { error: "method not allowed" } };
+      return settingsRoute(agent, settings, action, body);
+    }
+    if ((path === "/api/start" || path === "/api/stop") && method === "POST") {
+      const input = actionBody(body);
+      if (input instanceof type.errors) return { status: 400, body: { error: input.summary } };
+      if (!agent.config.services.some((s) => s.name === input.service)) {
+        return { status: 400, body: { error: `unknown service ${input.service}` } };
+      }
+      try {
+        if (path === "/api/start") await agent.start(input.service, input.force ?? false);
+        else await agent.stop(input.service, input.force ?? false);
+      } catch (err) {
+        if (err instanceof BusyError) return { status: 409, body: { error: err.message, service: err.service, risks: err.risks } };
+        return { status: 500, body: { error: (err as Error).message } };
+      }
+      return { status: 200, body: await agent.state() };
+    }
+    return { status: 404, body: { error: "not found" } };
+  };
+}
+
+export function createAgentServer(agent: Agent, token?: string, settings?: SettingsDeps) {
   const modelServices = () => agent.config.services.filter((s) => s.models.length > 0);
+  const api = apiRoutes(agent, settings);
 
   const authorized = (req: IncomingMessage) => {
     if (!token) return true;
@@ -36,50 +72,16 @@ export function createAgentServer(agent: Agent, token?: string) {
     const body = await readBody(req);
     const service = route(body);
     if (!service?.url) return json(res, 404, { error: "no service serves this model" });
-
-    // Listen for the client leaving before acquire(): a service can take
-    // minutes to start, and a missed close would leak the in-flight count.
-    let release: (() => void) | undefined;
-    let upstream: ClientRequest | undefined;
-    let clientGone = false;
-    res.once("close", () => {
-      clientGone = true;
-      release?.();
-      // A client that hangs up mid-stream should stop the generation too.
-      if (!res.writableFinished) upstream?.destroy();
-    });
-
-    try {
-      release = await agent.acquire(service.name);
-    } catch (err) {
-      if (err instanceof RefusedError) {
-        const headers: Record<string, string> = err.retryAfter ? { "retry-after": String(err.retryAfter) } : {};
-        return json(res, 503, { error: err.message }, headers);
-      }
-      return json(res, 502, { error: (err as Error).message });
-    }
-    if (clientGone) return release();
-
-    try {
-      const target = new URL(req.url ?? "/", service.url);
-      const send = target.protocol === "https:" ? requestTls : request;
-      // No pooled sockets: one from before a restart would fail with ECONNRESET.
-      upstream = send(target, { method: req.method, headers: { ...req.headers, host: target.host }, agent: false });
-    } catch (err) {
+    // hold() releases the card when the response closes.
+    const release = await hold(agent, service.name, res);
+    if (!release) return;
+    // Settings may have changed while the request waited; the service started with the new ones.
+    const url = agent.config.services.find((s) => s.name === service.name)?.url;
+    if (!url) {
       release();
-      return json(res, 502, { error: (err as Error).message });
+      return json(res, 404, { error: `${service.name} was removed` });
     }
-    upstream.once("response", (up) => {
-      res.writeHead(up.statusCode ?? 502, up.headers);
-      up.once("error", () => res.destroy());
-      up.once("aborted", () => res.destroy());
-      up.pipe(res);
-    });
-    upstream.once("error", (err) => {
-      if (res.headersSent) res.destroy();
-      else json(res, 502, { error: err.message });
-    });
-    upstream.end(body);
+    forward(req, res, url, { body });
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -89,29 +91,16 @@ export function createAgentServer(agent: Agent, token?: string) {
 
     if (path.startsWith("/api/")) {
       if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
-      if (path === "/api/state" && req.method === "GET") return json(res, 200, await agent.state());
-      if ((path === "/api/start" || path === "/api/stop") && req.method === "POST") {
-        let parsed: unknown;
+      let body: unknown = {};
+      if (req.method === "POST") {
         try {
-          parsed = JSON.parse((await readBody(req)).toString("utf8"));
+          body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
         } catch {
           return json(res, 400, { error: "body is not JSON" });
         }
-        const input = actionBody(parsed);
-        if (input instanceof type.errors) return json(res, 400, { error: input.summary });
-        if (!agent.config.services.some((s) => s.name === input.service)) {
-          return json(res, 400, { error: `unknown service ${input.service}` });
-        }
-        try {
-          if (path === "/api/start") await agent.start(input.service, input.force ?? false);
-          else await agent.stop(input.service, input.force ?? false);
-        } catch (err) {
-          if (err instanceof BusyError) return json(res, 409, { error: err.message, service: err.service, risks: err.risks });
-          return json(res, 500, { error: (err as Error).message });
-        }
-        return json(res, 200, await agent.state());
       }
-      return json(res, 404, { error: "not found" });
+      const reply = await api(req.method ?? "GET", path, body);
+      return json(res, reply.status, reply.body);
     }
 
     // Model lists come from config, so listing does not wake anything.
@@ -130,11 +119,6 @@ export function createAgentServer(agent: Agent, token?: string) {
       else json(res, 500, { error: err.message });
     });
   });
-}
-
-function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
-  res.writeHead(status, { ...headers, "content-type": "application/json" });
-  res.end(JSON.stringify(body));
 }
 
 async function readBody(req: IncomingMessage) {
