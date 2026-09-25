@@ -319,12 +319,17 @@ export function serviceName(raw: string, taken: ReadonlySet<string>) {
  * its first listening port. The proxy goes on that port + 10000, or the next
  * port no other proxy and not the agent uses. Raw TCP services (Wyoming, whose
  * health check is "tcp") get no proxy: it only carries HTTP and WebSockets.
+ * `busy`: ports something else listens on, also skipped.
  */
-export function proposeService(found: Found, view: SettingsView) {
+export function proposeService(
+  found: Found,
+  view: { port: number; services: readonly { name: string; url?: string | null; proxy?: number | null }[] },
+  busy: ReadonlySet<number> = new Set(),
+) {
   const plugin = plugins.get(found.plugin ?? "custom");
   const { ports } = found;
   const port = plugin && plugin.port > 0 && (ports.length === 0 || ports.includes(plugin.port)) ? plugin.port : ports[0];
-  const taken = reservedPorts(view.port, view.services);
+  const taken = new Set([...reservedPorts(view.port, view.services), ...busy]);
   // Ports past 65535 wrap around into 1024 and up.
   const next = (p: number) => ((p - 1_024) % (65_536 - 1_024)) + 1_024;
   let proxy = port === undefined || plugin?.health === "tcp" ? undefined : next(port + 10_000);
