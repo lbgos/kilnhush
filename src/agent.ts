@@ -1,35 +1,69 @@
-// The mode state machine. One mode owns the GPU at a time. Switching away
-// from a mode asks its probes first and refuses while stopping would lose
-// work, unless forced. Modes with `idle` wake on proxied requests and fall
-// back to the default mode on their own; the rest only change by hand.
+// The card's owner. One service holds the GPU at a time. Proxied requests,
+// starts and stops by hand, and a periodic tick ask src/plan.ts what to do
+// and carry the answer out here, one at a time. Taking the card from a
+// service asks its probes first and refuses while that would lose work,
+// unless forced.
+import { basename } from "node:path";
 import type { AgentEvent, State } from "./api.ts";
-import type { Config, JupyterSpec, ModeSpec, ServiceSpec } from "./config.ts";
+import type { Config, ServiceSpec } from "./config.ts";
+import { type GpuProcess, SELF } from "./discover.ts";
+import { type Snapshot, planRequest, planTick } from "./plan.ts";
 import { type Activity, type Gpu, mergeActivity } from "./probe.ts";
-import type { Service } from "./services.ts";
+import { type Runner, type RunnerSpec, waitHealthy } from "./runners.ts";
 
 export class BusyError extends Error {
   constructor(
-    readonly mode: string,
+    readonly service: string,
     readonly risks: string[],
   ) {
-    super(`${mode} is busy: ${risks.join("; ")}`);
+    super(`${service} is busy: ${risks.join("; ")}`);
   }
 }
 
-/** A proxied request wants the GPU, but a mode that only stops by hand holds it. */
-export class HeldError extends Error {
-  constructor(readonly mode: string) {
-    super(`GPU is held by ${mode} mode`);
+/** A proxied request that cannot have the card now. `retryAfter` is in seconds. */
+export class RefusedError extends Error {
+  constructor(
+    reason: string,
+    readonly retryAfter?: number,
+  ) {
+    super(reason);
   }
 }
 
 export type AgentDeps = {
-  service: (spec: ServiceSpec) => Service;
-  jupyter: (spec: JupyterSpec) => Promise<Activity>;
+  runner: (spec: RunnerSpec) => Runner;
+  /** The plugin's busy probe, or null for services without one. */
+  probe: (service: ServiceSpec) => Promise<Activity | null>;
   gpu: () => Promise<Gpu | null>;
+  /** Compute processes on the managed GPU. Empty where nvidia-smi is missing. */
+  gpuProcesses: () => Promise<GpuProcess[]>;
+  host: string;
   now: () => number;
+  sleep: (ms: number) => Promise<unknown>;
   log: (msg: string) => void;
 };
+
+/** What must not change under a running service. */
+const runShape = (s: ServiceSpec) => JSON.stringify([s.plugin.id, s.url, s.health, s.procs]);
+
+/**
+ * Splits GPU processes into the holder's memory use and the processes no
+ * service owns. Processes in the agent's own unit are the holder's commands.
+ */
+export function gpuUse(procs: GpuProcess[], services: ServiceSpec[], holder: string | null) {
+  const owners = new Map(services.flatMap((s) => s.procs.map((p) => [p.key, s.name] as const)));
+  let vram: number | null = null;
+  const unmanaged: State["unmanaged"] = [];
+  for (const p of procs) {
+    const key = p.owner && `${p.owner.kind}:${p.owner.name}`;
+    const owner = key === `unit:${SELF}` ? holder : key && owners.get(key);
+    if (owner && owner === holder) vram = (vram ?? 0) + p.usedMiB;
+    if (owner) continue;
+    const command = basename(p.cmdline.split(" ")[0] ?? "") || "?";
+    unmanaged.push({ pid: p.pid, name: p.owner?.name ?? command, usedMiB: p.usedMiB });
+  }
+  return { vram, unmanaged };
+}
 
 /** Runs async sections one at a time, in call order. */
 class Lock {
@@ -42,167 +76,327 @@ class Lock {
 }
 
 export class Agent {
-  #current: string | null = null;
+  #config: Config;
+  #holder: string | null = null;
+  /** Target of the switch in progress, null for a plain stop. */
   #switching: string | null = null;
+  /** Closed while a switch runs, so new requests queue on the lock instead of starting. */
+  #gate = false;
+  /** The holder was started by hand and has not idled out since. */
+  #pinned = false;
+  /** The home service was stopped by hand. */
+  #homePaused = false;
   /** Set when cleanup after a failed start did not finish. Only a forced switch clears it. */
   #stuck: string | null = null;
   #closing = false;
   #since = 0;
   #inflight = new Map<string, number>();
   #lastRequest = new Map<string, number>();
+  #waiting = new Map<string, number>();
   #events: AgentEvent[] = [];
   #lock = new Lock();
-  #services = new Map<string, Service>();
+  #runners = new Map<string, Runner>();
+  /** The spec each runner was made from, as JSON. */
+  #runnerShapes = new Map<string, string>();
+  #stopListeners = new Set<(name: string) => void>();
+  #configListeners = new Set<(config: Config) => void>();
 
   constructor(
-    readonly config: Config,
+    config: Config,
     private deps: AgentDeps,
   ) {
-    for (const mode of config.modes.values()) {
-      for (const spec of mode.services) {
-        if (!this.#services.has(spec.key)) this.#services.set(spec.key, deps.service(spec));
-      }
-    }
+    this.#config = config;
+    this.#syncRunners();
   }
 
-  get current() {
-    return this.#current;
+  get config() {
+    return this.#config;
   }
 
-  mode(name: string): ModeSpec {
-    const mode = this.config.modes.get(name);
-    if (!mode) throw new RangeError(`unknown mode ${name}`);
-    return mode;
+  get holder() {
+    return this.#holder;
+  }
+
+  service(name: string): ServiceSpec {
+    const service = this.#config.services.find((s) => s.name === name);
+    if (!service) throw new RangeError(`unknown service ${name}`);
+    return service;
   }
 
   /**
-   * Adopts the mode whose services are exactly the ones running. Starts the
-   * default mode when only (some of) its services run. Anything else, like
-   * two modes at once or half of a manual mode, throws: the agent will not
-   * guess which work is safe to stop.
+   * Adopts the service whose processes are exactly the ones running. Starts
+   * home when nothing or only part of home runs. Anything else, like two
+   * services at once, throws: the agent will not guess which work is safe to
+   * stop.
    */
   init() {
     return this.#lock.run(async () => {
-      const all = [...this.#services.values()];
-      const states = await Promise.all(all.map((s) => s.active()));
-      const running = new Set(all.filter((_, i) => states[i]).map((s) => s.key));
-      const keysOf = (name: string) => new Set(this.mode(name).services.map((s) => s.key));
+      const all = [...this.#runners.values()];
+      const states = await Promise.all(all.map((r) => r.active()));
+      const running = new Set(all.filter((_, i) => states[i]).map((r) => r.key));
+      const keysOf = (s: ServiceSpec) => new Set(s.procs.map((p) => p.key));
 
-      for (const name of this.config.modes.keys()) {
-        const keys = keysOf(name);
+      for (const s of this.#config.services) {
+        const keys = keysOf(s);
         if (running.size > 0 && keys.size === running.size && [...running].every((k) => keys.has(k))) {
-          this.#current = name;
+          this.#holder = s.name;
           this.#since = this.deps.now();
-          this.#event("switch", `found ${name} running`);
+          this.#event("start", `found ${s.name} running`);
           return;
         }
       }
-      const defaults = keysOf(this.config.default);
-      if ([...running].every((k) => defaults.has(k))) return this.#switch(this.config.default, true);
-      throw new Error(`unclear GPU state, running: ${[...running].join(", ")}. Stop the extra services by hand.`);
+      const home = this.#config.home;
+      const homeKeys = home ? keysOf(this.service(home)) : new Set<string>();
+      if (home && [...running].every((k) => homeKeys.has(k))) return this.#switch(home, true);
+      if (running.size === 0) return;
+      throw new Error(`unclear GPU state, running: ${[...running].join(", ")}. Stop the extra processes by hand.`);
     });
   }
 
-  /** Throws BusyError when the current mode has risks and `force` is false. */
-  switch(target: string, force = false) {
-    this.mode(target);
-    return this.#lock.run(() => this.#switch(target, force));
+  /**
+   * Gives the card to `name` by hand. Priority does not apply, but a busy
+   * holder needs `force`. An on_demand service started this way keeps the
+   * card against higher-ranked requests until it idles out once.
+   */
+  start(name: string, force = false) {
+    const target = this.service(name);
+    return this.#lock.run(async () => {
+      await this.#switch(name, force);
+      this.#pinned = target.run === "on_demand";
+      if (name === this.#config.home) this.#homePaused = false;
+    });
   }
 
   /**
-   * Called on a timer. Restarts the default mode after a failed switch and
-   * returns idle modes to it.
+   * Stops `name` by hand if it holds the card. Stopping home keeps it off
+   * until started again or another service idles out.
+   */
+  stop(name: string, force = false) {
+    this.service(name);
+    return this.#lock.run(async () => {
+      if (this.#holder !== name) return;
+      await this.#switch(null, force);
+      this.#homePaused = name === this.#config.home;
+    });
+  }
+
+  /**
+   * Called on a timer. Stops an on_demand holder that idled out and brings
+   * home back to a free card.
    */
   tick() {
     return this.#lock.run(async () => {
-      const current = this.#current;
-      if (this.#closing) return;
-      if (current === null) {
-        if (this.#stuck) return;
-        await this.#switch(this.config.default, true).catch((err: Error) => this.deps.log(`recover: ${err.message}`));
-        return;
+      if (this.#closing || (this.#holder === null && this.#stuck)) return;
+      const snap = await this.#snapshot();
+      const plan = planTick(snap);
+      if (plan.act === "start") {
+        await this.#switch(plan.name, true).catch((err: Error) => this.deps.log(`home: ${err.message}`));
+      } else if (plan.act === "release") {
+        const holder = snap.services.find((v) => v.name === snap.holder);
+        this.#event("idle", `${snap.holder} idle ${Math.round((snap.now - (holder?.lastActive ?? snap.now)) / 1000)}s`);
+        await this.#switch(plan.then, false)
+          .then(() => {
+            this.#pinned = false;
+            if (plan.then !== null) this.#homePaused = false;
+          })
+          .catch((err: Error) => this.deps.log(`idle stop: ${err.message}`));
       }
-      const mode = this.mode(current);
-      if (!mode.idle) return;
-      const act = await this.#activity(current);
-      if (act.busy || act.risks.length > 0) return;
-      const idleFor = this.deps.now() - act.lastActive;
-      if (idleFor < mode.idle) return;
-      this.#event("idle", `${current} idle ${Math.round(idleFor / 1000)}s`);
-      await this.#switch(this.config.default, false).catch((err: Error) => this.deps.log(`idle return: ${err.message}`));
     });
   }
 
   /**
-   * Makes `name` the current mode for one proxied request and counts it in
-   * flight until the returned release runs. Wakes the mode when the default
-   * mode or another idle-managed mode holds the GPU.
+   * Gets the card for one proxied request to `name` and counts it in flight
+   * until the returned release runs. Waits up to the service's `wait` while a
+   * lower-ranked holder finishes its work; throws RefusedError when the card
+   * is not to be had. An aborted `signal` (the client left) ends the wait
+   * and throws its reason instead of switching for nobody.
    */
-  async acquire(name: string): Promise<() => void> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      // While a switch away from `name` stops its services, `current` still
-      // names it; new requests must wait for the switch instead.
-      if (this.#current === name && this.#switching === null) return this.#begin(name);
-      await this.#lock.run(async () => {
-        const current = this.#current;
-        if (current === name) return;
-        if (this.#stuck) throw new BusyError("unknown", [this.#stuck]);
-        if (current !== null && current !== this.config.default && !this.mode(current).idle) {
-          throw new HeldError(current);
+  async acquire(name: string, signal?: AbortSignal): Promise<() => void> {
+    const spec = this.service(name);
+    const deadline = this.deps.now() + spec.wait;
+    let waiting = false;
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        if (this.#holder === name && !this.#gate && !this.#waiterAbove(name)) return this.#begin(name);
+        const plan = await this.#lock.run(async () => {
+          if (this.#closing) throw new RefusedError("the agent is shutting down");
+          if (this.#stuck) throw new RefusedError(this.#stuck);
+          const p = planRequest(await this.#snapshot(), name);
+          if (p.act === "use") return { release: this.#begin(name) };
+          if (p.act !== "switch") return p;
+          signal?.throwIfAborted();
+          this.#event("wake", `request for ${name}`);
+          try {
+            await this.#switch(name, false);
+          } catch (err) {
+            // Work arrived at the holder since the snapshot: wait like any busy holder.
+            if (err instanceof BusyError) return { act: "wait" as const, on: err.service };
+            throw err;
+          }
+          this.#pinned = false;
+          return { release: this.#begin(name) };
+        });
+        if ("release" in plan) return plan.release;
+        if (plan.act === "refuse") throw new RefusedError(plan.reason, plan.retryAfter);
+        if (this.deps.now() >= deadline) throw new RefusedError(`gave up waiting for ${plan.on}`, 30);
+        if (!waiting) {
+          waiting = true;
+          this.#waiting.set(name, (this.#waiting.get(name) ?? 0) + 1);
         }
-        this.#event("wake", `request for ${name}`);
-        await this.#switch(name, false);
-      });
+        await this.deps.sleep(1_000);
+      }
+    } finally {
+      if (waiting) this.#waiting.set(name, (this.#waiting.get(name) ?? 1) - 1);
     }
-    throw new Error(`${name} kept changing while waiting`);
+  }
+
+  /**
+   * Whether `name` holds the card with no switch in progress, for requests
+   * that must not wake it. While the card is switching to `name`, answers
+   * once that switch is done, so requests right after a page load that woke
+   * the service get through. The switch is bounded by the runners' timeouts.
+   */
+  async running(name: string): Promise<boolean> {
+    if (this.#switching === name) await this.#lock.run(async () => {});
+    return this.#holder === name && !this.#gate;
+  }
+
+  /** Calls `fn` with a service's name each time its processes have stopped. Returns an unsubscribe. */
+  onStop(fn: (name: string) => void) {
+    this.#stopListeners.add(fn);
+    return () => void this.#stopListeners.delete(fn);
+  }
+
+  /** Calls `fn` after each config change is applied. Returns an unsubscribe. */
+  onConfig(fn: (config: Config) => void) {
+    this.#configListeners.add(fn);
+    return () => void this.#configListeners.delete(fn);
   }
 
   async state(): Promise<State> {
-    const current = this.#current;
-    const act = current
-      ? await this.#activity(current)
-      : { busy: false, risks: this.#stuck ? [this.#stuck] : [], lastActive: this.#since };
-    const remind = current ? this.mode(current).remind : 0;
+    const holder = this.#holder;
+    const act = holder ? await this.#activity(holder) : null;
+    const remind = holder ? this.service(holder).remind : 0;
+    const lastActive = act?.lastActive ?? this.#since;
+    const procs = await this.deps.gpuProcesses().catch(() => []);
     return {
-      mode: current,
+      holder,
       switching: this.#switching,
-      default: this.config.default,
-      modes: [...this.config.modes.keys()],
+      home: this.#config.home,
+      homePaused: this.#homePaused,
+      pinned: this.#pinned,
       since: this.#since,
-      busy: act.busy,
-      risks: act.risks,
-      lastActive: act.lastActive,
-      reminderDue: remind > 0 && !act.busy && this.deps.now() - act.lastActive >= remind,
+      busy: act?.busy ?? false,
+      risks: act?.risks ?? (this.#stuck ? [this.#stuck] : []),
+      lastActive,
+      reminderDue: remind > 0 && !act?.busy && this.deps.now() - lastActive >= remind,
+      services: this.#config.services.map((s) => ({
+        name: s.name,
+        plugin: s.plugin.name,
+        run: s.run,
+        idle: s.idle,
+        proxy: s.proxy ?? null,
+        models: s.models,
+      })),
+      warnings: this.#config.warnings,
       gpu: await this.deps.gpu(),
+      host: this.deps.host,
+      ...gpuUse(procs, this.#config.services, holder),
       events: this.#events.slice(-20).reverse(),
     };
   }
 
   /**
-   * Stops services the agent spawned itself; systemd units keep running.
-   * Command services are children of the agent and cannot outlive it, so
-   * anything that must survive an agent restart belongs in a unit. This runs
-   * on a normal stop. If the agent crashes, its supervisor has to kill the
-   * rest: the example unit uses KillMode=control-group.
+   * Swaps in the config `build` returns. The holder must still exist and run
+   * the same way: removing it or changing its plugin, url or processes is
+   * refused until it stops. Other changes only affect later decisions; a new
+   * priority order never evicts anything by itself. `build` and `commit` run
+   * inside the lock, so edits apply in order, and a failed commit changes
+   * nothing.
+   */
+  reconfigure(build: () => Config | Promise<Config>, commit: (next: Config) => Promise<unknown> = async () => {}) {
+    return this.#lock.run(async () => {
+      // Leftovers of a failed start must stay known until a forced start clears them.
+      if (this.#stuck) throw new Error(this.#stuck);
+      const next = await build();
+      // The listener and the GPU reader are set up once, at startup.
+      if (next.listen !== this.#config.listen || next.gpu !== this.#config.gpu) {
+        throw new Error("listen and gpu change only with a restart of the agent");
+      }
+      const holder = this.#holder;
+      if (holder) {
+        const after = next.services.find((s) => s.name === holder);
+        if (!after) throw new Error(`stop ${holder} before removing it`);
+        if (runShape(after) !== runShape(this.service(holder))) throw new Error(`stop ${holder} before changing how it runs`);
+        // A new run setting starts its idle clock now, so on_demand does not stop it at once.
+        if (after.run !== this.service(holder).run) this.#lastRequest.set(holder, this.deps.now());
+      }
+      await commit(next);
+      if (next.home !== this.#config.home) this.#homePaused = false;
+      this.#config = next;
+      this.#syncRunners();
+      for (const fn of this.#configListeners) fn(next);
+      return next;
+    });
+  }
+
+  /**
+   * Stops processes the agent spawned itself; units and containers keep
+   * running. Command processes are children of the agent and cannot outlive
+   * it, so anything that must survive an agent restart belongs in a unit or
+   * container. This runs on a normal stop. If the agent crashes, its
+   * supervisor has to kill the rest: the example unit uses
+   * KillMode=control-group.
    */
   shutdown() {
     // Queue behind a switch in progress, so a command it is starting cannot
     // outlive the agent. Switches queued after this one refuse to run.
     this.#closing = true;
     return this.#lock.run(async () => {
-      const current = this.#current;
-      if (current) {
-        const { risks } = await this.#activity(current);
-        if (risks.length > 0) this.deps.log(`shutdown stops ${current} command services despite: ${risks.join("; ")}`);
+      const holder = this.#holder;
+      if (holder) {
+        const { risks } = await this.#activity(holder);
+        if (risks.length > 0) this.deps.log(`shutdown stops ${holder} command processes despite: ${risks.join("; ")}`);
       }
       await Promise.all(
-        [...this.#services.values()].filter((s) => s.key.startsWith("cmd:")).map((s) => s.stop().catch(() => {})),
+        [...this.#runners.values()].filter((r) => r.key.startsWith("cmd:")).map((r) => r.stop().catch(() => {})),
       );
     });
   }
 
-  #servicesOf(name: string) {
-    return this.mode(name).services.map((spec) => this.#services.get(spec.key) as Service);
+  /**
+   * One runner per process key. A runner is replaced when its spec changed,
+   * except the holder's: those keep their running child, and reconfigure
+   * already refused changes to how the holder runs.
+   */
+  #syncRunners() {
+    const keys = new Set<string>();
+    const held = new Set(this.#holder ? this.service(this.#holder).procs.map((p) => p.key) : []);
+    for (const service of this.#config.services) {
+      for (const proc of service.procs) {
+        keys.add(proc.key);
+        const spec = { ...proc, readyTimeout: service.readyTimeout };
+        const shape = JSON.stringify(spec);
+        if (this.#runnerShapes.get(proc.key) === shape || (held.has(proc.key) && this.#runners.has(proc.key))) continue;
+        this.#runners.set(proc.key, this.deps.runner(spec));
+        this.#runnerShapes.set(proc.key, shape);
+      }
+    }
+    for (const key of this.#runners.keys()) {
+      if (keys.has(key)) continue;
+      this.#runners.delete(key);
+      this.#runnerShapes.delete(key);
+    }
+  }
+
+  #runnersOf(name: string) {
+    return this.service(name).procs.map((p) => this.#runners.get(p.key) as Runner);
+  }
+
+  #waiterAbove(name: string) {
+    const rank = this.#config.services.findIndex((s) => s.name === name);
+    return this.#config.services.slice(0, rank).some((s) => (this.#waiting.get(s.name) ?? 0) > 0);
   }
 
   #begin(name: string) {
@@ -216,8 +410,26 @@ export class Agent {
     };
   }
 
+  async #snapshot(): Promise<Snapshot> {
+    const holder = this.#holder;
+    const act = holder ? await this.#activity(holder) : null;
+    return {
+      now: this.deps.now(),
+      holder,
+      pinned: this.#pinned,
+      homePaused: this.#homePaused,
+      waiting: new Set([...this.#waiting].filter(([, n]) => n > 0).map(([name]) => name)),
+      services: this.#config.services.map((s) => ({
+        name: s.name,
+        run: s.run,
+        idle: s.idle,
+        ...(s.name === holder && act ? act : { busy: false, risks: [], lastActive: 0 }),
+      })),
+    };
+  }
+
   async #activity(name: string): Promise<Activity> {
-    const mode = this.mode(name);
+    const spec = this.service(name);
     const now = this.deps.now();
     const act: Activity = {
       busy: false,
@@ -226,75 +438,89 @@ export class Agent {
     };
     const inflight = this.#inflight.get(name) ?? 0;
     if (inflight > 0) mergeActivity(act, { busy: true, risks: [`${inflight} request(s) in flight`], lastActive: now });
-    if (mode.jupyter) mergeActivity(act, await this.deps.jupyter(mode.jupyter));
-    if (mode.gpuGuard > 0) {
+    const probed = await this.deps.probe(spec);
+    if (probed) mergeActivity(act, probed);
+    if (spec.gpuGuard > 0) {
       const gpu = await this.deps.gpu();
       if (!gpu) {
         mergeActivity(act, { busy: false, risks: ["GPU reading unavailable"], lastActive: now });
-      } else if (gpu.util >= mode.gpuGuard) {
+      } else if (gpu.util >= spec.gpuGuard) {
         mergeActivity(act, { busy: true, risks: [`GPU at ${gpu.util}%`], lastActive: now });
       }
     }
     return act;
   }
 
-  /** Must run inside the lock. */
-  async #switch(target: string, force: boolean) {
+  /** Stops the holder and starts `target`, or only stops for null. Must run inside the lock. */
+  async #switch(target: string | null, force: boolean) {
     if (this.#closing) throw new Error("agent is shutting down");
-    const from = this.#current;
+    const from = this.#holder;
     if (from === target) return;
     if (this.#stuck && !force) throw new BusyError("unknown", [this.#stuck]);
-    if (from !== null && !force) {
-      const act = await this.#activity(from);
-      // The await above lets requests start, so read the counter again.
-      const inflight = this.#inflight.get(from) ?? 0;
-      const risks = act.risks.length > 0 || inflight === 0 ? act.risks : [`${inflight} request(s) in flight`];
-      if (risks.length > 0) {
-        this.#event("refuse", `${from} → ${target}: ${risks.join("; ")}`);
-        throw new BusyError(from, risks);
-      }
-    }
+    const what = target ? `${from ?? "none"} → ${target}` : `stop ${from}`;
+    const forced = force && from !== null ? " (forced)" : "";
 
+    this.#gate = true;
     this.#switching = target;
-    const next = this.#servicesOf(target);
-    const keep = new Set(next.map((s) => s.key));
     try {
-      // If a stop fails, `current` keeps naming the old mode, so recovery
-      // never starts the default mode on top of whatever is still running.
-      // With no current mode, whatever still runs is a leftover of a failed
-      // switch. Stop it before starting the target.
-      const old = from !== null ? this.#servicesOf(from).reverse() : [...this.#services.values()];
-      for (const s of old) {
-        if (keep.has(s.key)) continue;
-        if (from !== null || (await s.active())) await s.stop();
+      if (from !== null && !force) {
+        const act = await this.#activity(from);
+        // A request may have begun before the gate closed; read the count again.
+        const inflight = this.#inflight.get(from) ?? 0;
+        const risks = act.risks.length > 0 || inflight === 0 ? act.risks : [`${inflight} request(s) in flight`];
+        if (risks.length > 0) {
+          this.#event("refuse", `${what}: ${risks.join("; ")}`);
+          throw new BusyError(from, risks);
+        }
       }
-    } catch (err) {
-      this.#switching = null;
-      this.#event("fail", `stopping ${from}: ${(err as Error).message}`);
-      throw err;
-    }
 
-    this.#current = null;
-    try {
-      for (const s of next) await s.start();
-      this.#current = target;
-      this.#stuck = null;
-      this.#since = this.deps.now();
-      this.#event("switch", `${from ?? "none"} → ${target}${force && from !== null ? " (forced)" : ""}`);
-    } catch (err) {
-      this.#event("fail", `${from ?? "none"} → ${target}: ${(err as Error).message}`);
-      const leftovers: string[] = [];
-      for (const s of [...next].reverse()) {
-        await s.stop().catch((stopErr: Error) => leftovers.push(`${s.name}: ${stopErr.message}`));
+      const next = target ? this.#runnersOf(target) : [];
+      const keep = new Set(next.map((r) => r.key));
+      try {
+        // If a stop fails, the holder stays, so recovery never starts home on
+        // top of whatever still runs. With no holder, whatever runs is a
+        // leftover of a failed switch; stop it before starting the target.
+        const old = from !== null ? this.#runnersOf(from).reverse() : [...this.#runners.values()];
+        for (const r of old) {
+          if (keep.has(r.key)) continue;
+          if (from !== null || (await r.active())) await r.stop();
+        }
+      } catch (err) {
+        this.#event("fail", `stopping ${from}: ${(err as Error).message}`);
+        throw err;
       }
-      // Something may still hold the GPU. Recovering on top of it could run
-      // two modes at once, so wait for a person to force the next switch.
-      if (leftovers.length > 0) {
-        this.#stuck = `cleanup after failed ${target} start did not finish (${leftovers.join("; ")})`;
-        this.#event("fail", this.#stuck);
+
+      this.#holder = null;
+      if (from !== null) for (const fn of this.#stopListeners) fn(from);
+      if (target === null) {
+        this.#event("stop", `${from}${forced}`);
+        return;
       }
-      throw err;
+      try {
+        const spec = this.service(target);
+        for (const r of next) await r.start();
+        const alive = async () => (await Promise.all(next.map((r) => r.active()))).every(Boolean);
+        await waitHealthy(target, spec.health, spec.readyTimeout, alive);
+        this.#holder = target;
+        this.#stuck = null;
+        this.#since = this.deps.now();
+        this.#event("start", `${from ?? "none"} → ${target}${forced}`);
+      } catch (err) {
+        this.#event("fail", `${from ?? "none"} → ${target}: ${(err as Error).message}`);
+        const leftovers: string[] = [];
+        for (const r of [...next].reverse()) {
+          await r.stop().catch((stopErr: Error) => leftovers.push(`${r.name}: ${stopErr.message}`));
+        }
+        // Something may still hold the GPU. Starting home on top of it could
+        // run two services at once, so wait for a person to force the next switch.
+        if (leftovers.length > 0) {
+          this.#stuck = `cleanup after failed ${target} start did not finish (${leftovers.join("; ")})`;
+          this.#event("fail", this.#stuck);
+        }
+        throw err;
+      }
     } finally {
+      this.#gate = false;
       this.#switching = null;
     }
   }
